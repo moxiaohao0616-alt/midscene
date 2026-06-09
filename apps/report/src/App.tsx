@@ -11,7 +11,6 @@ import {
 } from '@midscene/core';
 import { antiEscapeScriptTag } from '@midscene/shared/utils';
 import {
-  Logo,
   Player,
   globalThemeConfig,
   useGlobalPreference,
@@ -29,7 +28,6 @@ import type {
   PlaywrightTasks,
   VisualizerProps,
 } from './types';
-import { formatModelBriefText } from './utils/model-brief';
 import {
   getEmptyDumpDescription,
   parseDumpAttributes,
@@ -84,11 +82,9 @@ function Visualizer(props: VisualizerProps): JSX.Element {
   const setPlayingTaskId = useExecutionDump((store) => store.setPlayingTaskId);
   const setGroupedDump = useExecutionDump((store) => store.setGroupedDump);
   const sdkVersion = useExecutionDump((store) => store.sdkVersion);
-  const modelBriefs = useExecutionDump((store) => store.modelBriefs);
   const playwrightAttributes = useExecutionDump(
     (store) => store.playwrightAttributes,
   );
-  const modelBriefText = formatModelBriefText(modelBriefs);
   const reset = useExecutionDump((store) => store.reset);
   const [mainLayoutChangeFlag, setMainLayoutChangeFlag] = useState(0);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
@@ -324,13 +320,12 @@ function Visualizer(props: VisualizerProps): JSX.Element {
         data-theme={isDarkMode ? 'dark' : 'light'}
       >
         <div className="page-nav">
-          <div className="page-nav-left">
-            <Logo />
-          </div>
+          {/* fork: Midscene logo intentionally removed from the report header */}
+          <div className="page-nav-left" />
           <div className="page-nav-right">
             <div className="page-nav-version">
               {sdkVersion ? `v${sdkVersion}` : 'unknown version'}
-              {modelBriefText ? ` | ${modelBriefText}` : ''}
+              {/* fork: model brief intentionally hidden in the report header */}
             </div>
             <div className="theme-divider" />
             <button
