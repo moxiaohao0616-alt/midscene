@@ -1,17 +1,17 @@
 import { getModelRuntime } from '@/ai-model/models';
 import { callAIWithObjectResponse } from '@/ai-model/service-caller';
-import { AiJudgeOrderSensitive } from '@/ai-model/workflows/inspect';
+import { AiJudgeOrderSensitive } from '@/ai-model/workflows/insight';
 import type { AIUsageInfo } from '@/types';
 import type { IModelConfig } from '@midscene/shared/env';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, rs } from '@rstest/core';
 
-vi.mock('@/ai-model/service-caller', () => ({
-  callAIWithObjectResponse: vi.fn(),
+rs.mock('@/ai-model/service-caller', () => ({
+  callAIWithObjectResponse: rs.fn(),
 }));
 
 describe('AiJudgeOrderSensitive', () => {
   beforeEach(() => {
-    vi.mocked(callAIWithObjectResponse).mockReset();
+    rs.mocked(callAIWithObjectResponse).mockReset();
   });
 
   it('judges order sensitivity with generated messages', async () => {
@@ -23,12 +23,13 @@ describe('AiJudgeOrderSensitive', () => {
       time_cost: undefined,
       model_name: undefined,
       model_description: undefined,
+      response_model_name: undefined,
       intent: undefined,
       slot: undefined,
       request_id: undefined,
     };
 
-    vi.mocked(callAIWithObjectResponse).mockResolvedValue({
+    rs.mocked(callAIWithObjectResponse).mockResolvedValue({
       content: { isOrderSensitive: true },
       usage,
       contentString: '{"isOrderSensitive": true}',

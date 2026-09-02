@@ -1,21 +1,50 @@
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, rs } from '@rstest/core';
 import {
   playgroundForAgent,
   playgroundForAgentFactory,
 } from '../../src/launcher';
 import { launchPreparedPlaygroundPlatform } from '../../src/platform-launcher';
+import {
+  buildPlaygroundBrowserUrl,
+  resolvePlaygroundListenHost,
+} from '../../src/server';
 
 function createMockAgent() {
   return {
     interface: {},
-    destroy: vi.fn(async () => {}),
+    destroy: rs.fn(async () => {}),
   } as any;
 }
 
 const staticPath = path.resolve(process.cwd(), 'static');
 
 describe('playground launcher', () => {
+  it('should build browser URLs for IPv4, hostnames, and IPv6 literals', () => {
+    expect(buildPlaygroundBrowserUrl('127.0.0.1', 5921)).toBe(
+      'http://127.0.0.1:5921',
+    );
+    expect(buildPlaygroundBrowserUrl('localhost', 5921)).toBe(
+      'http://localhost:5921',
+    );
+    expect(buildPlaygroundBrowserUrl('::1', 5921)).toBe('http://[::1]:5921');
+  });
+
+  it('should default the listen host to 127.0.0.1', () => {
+    const originalHost = process.env.MIDSCENE_PLAYGROUND_HOST;
+    Reflect.deleteProperty(process.env, 'MIDSCENE_PLAYGROUND_HOST');
+
+    try {
+      expect(resolvePlaygroundListenHost()).toBe('127.0.0.1');
+    } finally {
+      if (originalHost === undefined) {
+        Reflect.deleteProperty(process.env, 'MIDSCENE_PLAYGROUND_HOST');
+      } else {
+        process.env.MIDSCENE_PLAYGROUND_HOST = originalHost;
+      }
+    }
+  });
+
   it('should launch with a custom static path and fixed id', async () => {
     const agent = createMockAgent();
 
@@ -28,6 +57,7 @@ describe('playground launcher', () => {
     });
 
     expect(result.port).toBe(5921);
+    expect(result.host).toBe('127.0.0.1');
     expect(result.server.id).toBe('launcher-instance-id');
     expect(result.server.staticPath).toBe(staticPath);
 
@@ -35,10 +65,33 @@ describe('playground launcher', () => {
     expect(agent.destroy).toHaveBeenCalledTimes(1);
   });
 
+  it('should return MIDSCENE_PLAYGROUND_HOST when configured', async () => {
+    const originalHost = process.env.MIDSCENE_PLAYGROUND_HOST;
+    process.env.MIDSCENE_PLAYGROUND_HOST = 'localhost';
+
+    try {
+      const result = await playgroundForAgent(createMockAgent()).launch({
+        port: 5924,
+        openBrowser: false,
+        verbose: false,
+        staticPath,
+      });
+
+      expect(result.host).toBe('localhost');
+      await result.close();
+    } finally {
+      if (originalHost === undefined) {
+        Reflect.deleteProperty(process.env, 'MIDSCENE_PLAYGROUND_HOST');
+      } else {
+        process.env.MIDSCENE_PLAYGROUND_HOST = originalHost;
+      }
+    }
+  });
+
   it('should launch from agent factory and allow server configuration', async () => {
-    const agentFactory = vi.fn(async () => createMockAgent());
+    const agentFactory = rs.fn(async () => createMockAgent());
     let configuredServer: any;
-    const configureServer = vi.fn((server: any) => {
+    const configureServer = rs.fn((server: any) => {
       configuredServer = server;
     });
 
@@ -62,8 +115,8 @@ describe('playground launcher', () => {
   it('should manage prepared platform sidecars for direct agent platforms', async () => {
     const sidecar = {
       id: 'mock-sidecar',
-      start: vi.fn(async () => {}),
-      stop: vi.fn(async () => {}),
+      start: rs.fn(async () => {}),
+      stop: rs.fn(async () => {}),
     };
 
     const result = await launchPreparedPlaygroundPlatform(

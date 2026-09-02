@@ -1,46 +1,39 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { IModelConfig } from '@midscene/shared/env';
+import { beforeEach, describe, expect, it, rs } from '@rstest/core';
 import ts from 'typescript';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({
-  callAI: vi.fn(),
-  callAIWithObjectResponse: vi.fn(),
-  AiExtractElementInfo: vi.fn(),
-  AiLocateElement: vi.fn(),
-  AiLocateSection: vi.fn(),
-  buildSearchAreaConfig: vi.fn(),
+const mocks = rs.hoisted(() => ({
+  callAI: rs.fn(),
+  callAIWithObjectResponse: rs.fn(),
+  AiExtractElementInfo: rs.fn(),
+  AiLocateElement: rs.fn(),
+  AiLocateSection: rs.fn(),
+  buildSearchAreaConfig: rs.fn(),
 }));
 
-vi.mock('@/ai-model/service-caller', () => ({
+rs.mock('@/ai-model/service-caller', () => ({
   AIResponseParseError: class AIResponseParseError extends Error {},
   callAI: mocks.callAI,
   callAIWithObjectResponse: mocks.callAIWithObjectResponse,
 }));
 
-vi.mock('@/ai-model/service-caller/index', () => ({
+rs.mock('@/ai-model/service-caller/index', () => ({
   AIResponseParseError: class AIResponseParseError extends Error {},
   callAI: mocks.callAI,
   callAIWithObjectResponse: mocks.callAIWithObjectResponse,
 }));
 
-vi.mock('@/ai-model/inspect', () => ({
-  AiExtractElementInfo: mocks.AiExtractElementInfo,
+rs.mock('@/ai-model/workflows/grounding', () => ({
   AiLocateElement: mocks.AiLocateElement,
   AiLocateSection: mocks.AiLocateSection,
   buildSearchAreaConfig: mocks.buildSearchAreaConfig,
 }));
 
-vi.mock('@midscene/shared/img', async () => {
-  const actual = await vi.importActual<typeof import('@midscene/shared/img')>(
-    '@midscene/shared/img',
-  );
-  return {
-    ...actual,
-    imageInfoOfBase64: vi.fn().mockResolvedValue({ width: 800, height: 450 }),
-  };
-});
+rs.mock('@/ai-model/workflows/insight', () => ({
+  AiExtractElementInfo: mocks.AiExtractElementInfo,
+}));
 
 import { runConnectivityTest } from '@/ai-model/connectivity';
 
@@ -74,6 +67,7 @@ describe('runConnectivityTest service load order', () => {
     modelFamily: 'qwen2.5-vl',
     intent: 'default',
     slot: 'default',
+    retryCount: 3,
   };
   const planningModelConfig: IModelConfig = {
     modelName: 'test-planning-model',
@@ -81,6 +75,7 @@ describe('runConnectivityTest service load order', () => {
     modelFamily: 'qwen2.5-vl',
     intent: 'planning',
     slot: 'planning',
+    retryCount: 3,
   };
   const insightModelConfig: IModelConfig = {
     modelName: 'test-insight-model',
@@ -88,10 +83,11 @@ describe('runConnectivityTest service load order', () => {
     modelFamily: 'gpt-5',
     intent: 'insight',
     slot: 'insight',
+    retryCount: 3,
   };
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    rs.clearAllMocks();
   });
 
   it('runs the default locate check through the real Service constructor', async () => {
@@ -122,19 +118,19 @@ describe('runConnectivityTest service load order', () => {
     });
 
     expect(result.passed).toBe(true);
-    expect(result.checks.map((item) => item.intent)).toEqual([
-      'planning',
-      'insight',
-      'default',
-    ]);
+    expect(result.message).toBeUndefined();
     expect(mocks.AiLocateElement).toHaveBeenCalledWith(
       expect.objectContaining({
         targetElementDescription: 'the main todo input box',
         modelRuntime: expect.objectContaining({
-          config: defaultModelConfig,
+          config: expect.objectContaining({
+            ...defaultModelConfig,
+            retryCount: 0,
+          }),
         }),
       }),
     );
+    expect(defaultModelConfig.retryCount).toBe(3);
   });
 
   it('keeps service independent from the ai-model barrel', () => {

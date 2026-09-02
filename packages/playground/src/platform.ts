@@ -124,6 +124,107 @@ export interface PlaygroundRecorderEventsResult {
   nextIndex: number;
 }
 
+export interface PlaygroundRecorderDescribeTrace {
+  traceId: string;
+  eventHashId?: string;
+  eventType?: string;
+  actionType?: string;
+  eventSummary?: {
+    hashId?: string;
+    mergedHashIds?: string[];
+    type?: string;
+    source?: string;
+    actionType?: string;
+    timestamp?: number;
+    url?: string;
+    title?: string;
+    valueLength?: number;
+    rawPayloadSummary?: Record<string, unknown>;
+    elementRect?: {
+      left?: number;
+      top?: number;
+      width?: number;
+      height?: number;
+      x?: number;
+      y?: number;
+    };
+    pageInfo?: { width: number; height: number };
+  };
+  status: 'ready' | 'failed' | 'skipped';
+  error?: string;
+  startedAt: string;
+  durationMs: number;
+  modelCallDurationMs?: number;
+  point?: [number, number];
+  pageInfo?: { width: number; height: number };
+  screenshotBytes?: number;
+  screenshotRef?: {
+    path: string;
+    sha256: string;
+    bytes: number;
+    mimeType?: string;
+  };
+  annotatedScreenshotRef?: {
+    path: string;
+    sha256: string;
+    bytes: number;
+    mimeType?: string;
+  };
+  screenshotAnnotation?: {
+    inputPoint?: {
+      logical: [number, number];
+      screenshot: [number, number];
+    };
+    sourceTargetRect?: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    };
+    locateRect?: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    };
+    centerDelta?: {
+      x: number;
+      y: number;
+      distance: number;
+    };
+    distanceOutsideRect?: {
+      x: number;
+      y: number;
+      distance: number;
+    };
+  };
+  screenshotPersistError?: string;
+  annotatedScreenshotPersistError?: string;
+  elementDescription?: string;
+  verifyPrompt?: boolean;
+  verifyPassed?: boolean;
+  centerDistance?: number;
+  verifyResult?: {
+    pass?: boolean;
+    rect?: {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    };
+    center?: [number, number];
+    centerDistance?: number;
+    includedInRect?: boolean;
+  };
+}
+
+export interface PlaygroundRecorderDescribeResult {
+  ok: boolean;
+  event?: PlaygroundRecorderEvent;
+  trace?: PlaygroundRecorderDescribeTrace;
+  error?: string;
+}
+
 export interface PlaygroundSessionState {
   connected: boolean;
   displayName?: string;
@@ -131,6 +232,15 @@ export interface PlaygroundSessionState {
   setupState?: 'required' | 'ready' | 'blocked';
   setupBlockingReason?: string;
 }
+
+export interface PlaygroundSessionNavigationEvent {
+  url: string;
+  timestamp?: number;
+}
+
+export type PlaygroundSessionNavigationSubscriber = (
+  listener: (event: PlaygroundSessionNavigationEvent) => void,
+) => () => void;
 
 export interface PlaygroundCreatedSession {
   agent?: Agent;
@@ -143,6 +253,7 @@ export interface PlaygroundCreatedSession {
   platformDescription?: string;
   executionHooks?: PlaygroundExecutionHooks;
   sidecars?: PlaygroundSidecar[];
+  subscribeNavigationEvents?: PlaygroundSessionNavigationSubscriber;
 }
 
 export interface PlaygroundSessionManager {

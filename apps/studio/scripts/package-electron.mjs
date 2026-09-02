@@ -7,22 +7,36 @@ import { parseArgs } from 'node:util';
 import { notarize } from '@electron/notarize';
 import { packager } from '@electron/packager';
 import {
+  reportTemplateMagicString,
+  validateCoreReportTemplateModules,
+} from '../../../scripts/report-template-utils.mjs';
+import {
   writeAppUpdateYmlIntoResources,
   writeUpdateMetadataForArtifact,
 } from './build-update-metadata.mjs';
+import {
+  assertPackagedExternalResourcesUnpacked,
+  packagedAsarOptions,
+} from './packaged-asar-resources.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const studioRootDir = path.resolve(__dirname, '..');
 const workspaceRootDir = path.resolve(studioRootDir, '..', '..');
 const studioBuildDir = path.join(studioRootDir, 'build');
+const studioFontLicensePath = path.join(
+  studioRootDir,
+  'src',
+  'renderer',
+  'assets',
+  'fonts',
+  'OFL.txt',
+);
 const reportRootDir = path.join(workspaceRootDir, 'apps', 'report');
-const coreRootDir = path.join(workspaceRootDir, 'packages', 'core');
-const coreDistDir = path.join(coreRootDir, 'dist');
+const coreDistDir = path.join(workspaceRootDir, 'packages', 'core', 'dist');
 const reportTemplatePath = path.join(reportRootDir, 'dist', 'index.html');
-const reportTemplatePlaceholder = 'REPLACE_ME_WITH_REPORT_HTML';
 const unresolvedReportTemplatePattern = new RegExp(
-  String.raw`(?:=|return)\s*(['"])${reportTemplatePlaceholder}\1`,
+  String.raw`(?:=|return)\s*(['"])${reportTemplateMagicString}\1`,
 );
 
 // Keep release packaging state outside `apps/studio` so local build outputs do
@@ -36,6 +50,7 @@ export const artifactDir = path.join(releaseWorkspaceDir, 'artifacts');
 const packagingWorkspaceDir = path.join(releaseWorkspaceDir, 'workspace');
 const packagedDir = path.join(releaseWorkspaceDir, 'packaged');
 const packagedAppId = 'midscene-studio-beta';
+const packagedWindowsAppId = 'ai.midscene.studio.beta';
 const packagedProductName = 'Midscene Studio Beta';
 const packagedIgnorePatterns = [
   /^\/pnpm-lock\.yaml$/,
@@ -50,19 +65,6 @@ const packagedIgnorePatterns = [
   // Source maps duplicate what `pruneSourceMapFiles` already removed.
   /\.js\.map$/,
 ];
-const packagedAsarUnpackDirs = [
-  'node_modules/@computer-use/libnut',
-  'node_modules/@ffmpeg-installer',
-  'node_modules/@img',
-  'node_modules/@midscene/android/bin',
-  'node_modules/@midscene/computer/bin',
-  'node_modules/@midscene/computer/native',
-  'node_modules/sharp',
-].map((relativePath) => relativePath.split('/').join(path.sep));
-export const packagedAsarOptions = {
-  unpack: '**/{.**,**}/**/*.{node,dll,dylib,so,exe}',
-  unpackDir: `{${packagedAsarUnpackDirs.join(',')}}`,
-};
 const defaultMacEntitlementsPath = path.join(
   studioBuildDir,
   'entitlements.mac.plist',
@@ -168,18 +170,52 @@ const macMachOMagicHeaders = new Set([
   'feedface',
   'feedfacf',
 ]);
+const macThinMachOMagic = new Map([
+  [0xfeedface, 'be'],
+  [0xfeedfacf, 'be'],
+  [0xcefaedfe, 'le'],
+  [0xcffaedfe, 'le'],
+]);
+const macFatMachOMagic = new Map([
+  [0xcafebabe, { endian: 'be', archEntrySize: 20 }],
+  [0xcafebabf, { endian: 'be', archEntrySize: 32 }],
+  [0xbebafeca, { endian: 'le', archEntrySize: 20 }],
+  [0xbfbafeca, { endian: 'le', archEntrySize: 32 }],
+]);
+const macCpuTypeNames = new Map([
+  [0x00000007, 'x86'],
+  [0x01000007, 'x86_64'],
+  [0x0000000c, 'arm'],
+  [0x0100000c, 'arm64'],
+]);
+const macTargetArchNames = new Map([
+  ['x64', 'x86_64'],
+  ['arm64', 'arm64'],
+]);
 
 export const shouldUseShellForCommand = (
   command,
   platform = process.platform,
 ) => platform === 'win32' && /\.(cmd|bat)$/i.test(command);
 
+export const quoteWindowsShellArg = (arg) => {
+  if (arg === '') {
+    return '""';
+  }
+  if (!/[\s"&|<>()^]/.test(arg)) {
+    return arg;
+  }
+  return `"${arg.replace(/(["&|<>()^])/g, '^$1')}"`;
+};
+
 const run = (command, args, { cwd = workspaceRootDir, env } = {}) =>
   new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const shell = shouldUseShellForCommand(command);
+    const spawnArgs = shell ? args.map(quoteWindowsShellArg) : args;
+    const child = spawn(command, spawnArgs, {
       cwd,
       env: env ? { ...process.env, ...env } : process.env,
-      shell: shouldUseShellForCommand(command),
+      shell,
       stdio: 'inherit',
     });
 
@@ -411,6 +447,57 @@ export const buildPackagerOptions = ({ arch, outDir, platform, stageDir }) => ({
 
 const packageManagerCommand =
   process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+
+export const buildWindowsNsisArtifactName = (baseName) =>
+  `${baseName}-setup.exe`;
+
+export const buildWindowsNsisConfig = ({ artifactName, iconPath }) => ({
+  appId: packagedWindowsAppId,
+  productName: packagedProductName,
+  directories: {
+    output: artifactDir,
+  },
+  win: {
+    // `@electron/packager` names the prepackaged executable from its `name`
+    // option. electron-builder does not rename that executable when using
+    // `--prepackaged`, so NSIS must target the exact same product filename for
+    // shortcuts, process shutdown, and updater relaunch.
+    executableName: packagedProductName,
+    target: [
+      {
+        target: 'nsis',
+        arch: ['x64'],
+      },
+    ],
+    ...(iconPath ? { icon: iconPath } : {}),
+  },
+  nsis: {
+    oneClick: true,
+    perMachine: false,
+    allowElevation: false,
+    artifactName,
+    shortcutName: packagedProductName,
+    uninstallDisplayName: packagedProductName,
+    createDesktopShortcut: 'always',
+  },
+  npmRebuild: false,
+  publish: null,
+});
+
+export const buildWindowsNsisInstallerArgs = ({
+  arch,
+  configPath,
+  packagedAppPath,
+}) => [
+  'exec',
+  'electron-builder',
+  '--win',
+  'nsis',
+  `--${arch}`,
+  `--prepackaged=${packagedAppPath}`,
+  `--config=${configPath}`,
+  '--publish=never',
+];
 
 let cachedStudioElectronVersion;
 let cachedStudioPackageJson;
@@ -784,35 +871,6 @@ const prepareReportBuildOutput = async () => {
   await ensureReportTemplateReady();
 };
 
-const ensureCoreReportTemplateInjected = async () => {
-  let status = await getBuildStatus({
-    packageDir: coreRootDir,
-    sourceTargets: packageBuildSourceTargets,
-    additionalSourceTargets: [reportTemplatePath],
-  });
-
-  if (
-    !status.needsBuild &&
-    (await pathContainsReportTemplatePlaceholder(coreDistDir))
-  ) {
-    status = {
-      needsBuild: true,
-      reason: 'report template placeholder remains in build output',
-    };
-  }
-
-  if (status.needsBuild) {
-    console.log(`Building packages/core (${status.reason}).`);
-    await buildPackageDir(path.relative(workspaceRootDir, coreRootDir));
-  }
-
-  if (await pathContainsReportTemplatePlaceholder(coreDistDir)) {
-    throw new Error(
-      `packages/core build still contains ${reportTemplatePlaceholder}; rebuild apps/report before packaging.`,
-    );
-  }
-};
-
 const prepareStudioWorkspacePackages = async (workspacePackages) => {
   for (const workspacePackage of workspacePackages) {
     const status = await getBuildStatus({
@@ -861,7 +919,7 @@ const prepareStudioBuildOutput = async ({
 
   if (await pathContainsReportTemplatePlaceholder(studioDistDir)) {
     throw new Error(
-      `apps/studio build still contains ${reportTemplatePlaceholder}; rebuild apps/report before packaging.`,
+      `apps/studio build still contains ${reportTemplateMagicString}; rebuild apps/report before packaging.`,
     );
   }
 };
@@ -1263,6 +1321,10 @@ export const buildInstallWorkspaceManifest = ({
     dependencies: packageJson.dependencies,
     workspacePackages: vendoredWorkspacePackages,
   });
+  const optionalDependencies = buildResolvedWorkspaceDependencyVersions({
+    dependencies: packageJson.optionalDependencies,
+    workspacePackages: vendoredWorkspacePackages,
+  });
   const overrides = Object.fromEntries(
     vendoredWorkspacePackages.map((workspacePackage) => [
       workspacePackage.name,
@@ -1277,6 +1339,9 @@ export const buildInstallWorkspaceManifest = ({
 
   return {
     ...buildPackagedAppManifest(packageJson, version, dependencies),
+    ...(Object.keys(optionalDependencies).length > 0
+      ? { optionalDependencies }
+      : {}),
     pnpm: {
       overrides,
       ...(supportedArchitectures ? { supportedArchitectures } : {}),
@@ -1489,7 +1554,7 @@ const findPackagedAppPayloadDir = async (packagedAppPath) => {
   return null;
 };
 
-const findPackagedResourcesDir = async (packagedAppPath) => {
+const resolvePackagedResourcesDir = async (packagedAppPath) => {
   const candidates = await buildPackagedResourcesCandidates(packagedAppPath);
 
   for (const candidatePath of candidates) {
@@ -1505,7 +1570,9 @@ const findPackagedResourcesDir = async (packagedAppPath) => {
     }
   }
 
-  return null;
+  throw new Error(
+    `Unable to locate the resources directory in packaged Midscene Studio app: ${packagedAppPath}`,
+  );
 };
 
 const findPackagedNodeModulesDir = async (packagedAppPath) => {
@@ -1561,11 +1628,19 @@ export const assertPortablePackagedNodeModules = async (packagedAppPath) => {
   );
 };
 
+export const copyStudioFontLicenseToStageDir = async (stageDir) => {
+  const destinationPath = path.join(stageDir, 'licenses', 'Inter-OFL.txt');
+  await fs.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fs.copyFile(studioFontLicensePath, destinationPath);
+  return destinationPath;
+};
+
 const copyStudioBuildOutputToStageDir = async (stageDir) => {
   await fs.mkdir(stageDir, { recursive: true });
   await fs.cp(path.join(studioRootDir, 'dist'), path.join(stageDir, 'dist'), {
     recursive: true,
   });
+  await copyStudioFontLicenseToStageDir(stageDir);
 };
 
 const installStageDependencies = async (stageDir) => {
@@ -1600,9 +1675,9 @@ const createPackagingWorkspace = async ({
   await prepareStaticWorkspacePackageSources(workspacePackages);
   await prepareStudioWorkspacePackages(workspacePackages);
   await prepareReportBuildOutput();
-  await ensureCoreReportTemplateInjected();
+  validateCoreReportTemplateModules(coreDistDir);
   await prepareStudioBuildOutput({
-    additionalSourceTargets: [reportTemplatePath, coreDistDir],
+    additionalSourceTargets: [coreDistDir],
   });
   await removeIfExists(stageDir);
   await fs.mkdir(path.dirname(stageDir), { recursive: true });
@@ -1840,6 +1915,132 @@ const isMacStandaloneCodeFile = async (filePath) => {
   return isMacMachOFile(filePath);
 };
 
+const readUInt32ByEndian = (buffer, offset, endian) =>
+  endian === 'le' ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset);
+
+const readMacCpuTypeName = (buffer, offset, endian) => {
+  const cpuType = readUInt32ByEndian(buffer, offset, endian);
+  return macCpuTypeNames.get(cpuType) ?? `unknown(${cpuType})`;
+};
+
+export const readMacMachOArchitectures = async (filePath) => {
+  const fileHandle = await fs.open(filePath, 'r');
+  try {
+    const header = Buffer.alloc(8);
+    const { bytesRead } = await fileHandle.read(header, 0, header.length, 0);
+    if (bytesRead < header.length) {
+      return [];
+    }
+
+    const magic = header.readUInt32BE(0);
+    const thinEndian = macThinMachOMagic.get(magic);
+    if (thinEndian) {
+      return [readMacCpuTypeName(header, 4, thinEndian)];
+    }
+
+    const fatHeader = macFatMachOMagic.get(magic);
+    if (!fatHeader) {
+      return [];
+    }
+
+    const archCount = readUInt32ByEndian(header, 4, fatHeader.endian);
+    if (archCount < 1 || archCount > 512) {
+      throw new Error(
+        `Unexpected Mach-O architecture count ${archCount} in ${filePath}`,
+      );
+    }
+
+    const archBuffer = Buffer.alloc(archCount * fatHeader.archEntrySize);
+    const archBytes = await fileHandle.read(
+      archBuffer,
+      0,
+      archBuffer.length,
+      header.length,
+    );
+    if (archBytes.bytesRead < archBuffer.length) {
+      throw new Error(`Unable to read complete Mach-O fat header: ${filePath}`);
+    }
+
+    const archNames = [];
+    for (let index = 0; index < archCount; index += 1) {
+      archNames.push(
+        readMacCpuTypeName(
+          archBuffer,
+          index * fatHeader.archEntrySize,
+          fatHeader.endian,
+        ),
+      );
+    }
+    return [...new Set(archNames)];
+  } finally {
+    await fileHandle.close();
+  }
+};
+
+export const collectMacNativeArchitectureIssues = async ({ appPath, arch }) => {
+  const expectedArch = macTargetArchNames.get(arch);
+  if (!expectedArch) {
+    throw new Error(`Unsupported macOS package architecture "${arch}".`);
+  }
+
+  const issues = [];
+  const visitDirectory = async (dirPath) => {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
+
+      const entryPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        await visitDirectory(entryPath);
+        continue;
+      }
+
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      const actualArchs = await readMacMachOArchitectures(entryPath);
+      if (actualArchs.length > 0 && !actualArchs.includes(expectedArch)) {
+        issues.push({
+          path: entryPath,
+          expectedArch,
+          actualArchs,
+        });
+      }
+    }
+  };
+
+  await visitDirectory(appPath);
+  return issues;
+};
+
+export const assertMacNativeCodeArchitectures = async ({ appPath, arch }) => {
+  const issues = await collectMacNativeArchitectureIssues({ appPath, arch });
+  if (issues.length === 0) {
+    return;
+  }
+
+  const relativeIssues = issues
+    .slice(0, 20)
+    .map(
+      (issue) =>
+        `- ${path.relative(appPath, issue.path)}: expected ${issue.expectedArch}, found ${issue.actualArchs.join(', ')}`,
+    );
+  const remainingCount = issues.length - relativeIssues.length;
+  if (remainingCount > 0) {
+    relativeIssues.push(`- ...and ${remainingCount} more file(s)`);
+  }
+
+  throw new Error(
+    [
+      `Packaged macOS app contains native code for the wrong architecture (${arch}).`,
+      ...relativeIssues,
+    ].join('\n'),
+  );
+};
+
 export const collectNestedMacCodeSignTargets = async (appPath) => {
   const nestedBundles = [];
   const standaloneFiles = [];
@@ -1916,11 +2117,101 @@ export const buildStudioDmgSpecification = ({
   format: 'ULFO',
 });
 
-const runAppDmg = async ({ source, target }) => {
+const resolvePackageEntry = (packageDir) => {
+  const packageJsonPath = path.join(packageDir, 'package.json');
+  if (!existsSync(packageJsonPath)) {
+    return undefined;
+  }
+  const packageManifest = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+  return path.join(packageDir, packageManifest.main ?? 'index.js');
+};
+
+export const resolveNodeModulesPackageEntry = ({
+  packageName,
+  workspaceRoot = workspaceRootDir,
+}) => {
+  const packageDir = path.join(
+    workspaceRoot,
+    'node_modules',
+    ...packageName.split('/'),
+  );
+  return resolvePackageEntry(packageDir);
+};
+
+export const resolvePnpmPackageEntry = ({
+  packageName,
+  version,
+  workspaceRoot = workspaceRootDir,
+}) => {
+  const pnpmStoreDir = path.join(workspaceRoot, 'node_modules', '.pnpm');
+  if (!existsSync(pnpmStoreDir)) {
+    return undefined;
+  }
+
+  const storePackageName = packageName.replace('/', '+');
+  const storeEntryPrefix = `${storePackageName}@${version}`;
+  const packagePathSegments = packageName.split('/');
+  for (const storeEntry of readdirSync(pnpmStoreDir).sort()) {
+    if (
+      storeEntry !== storeEntryPrefix &&
+      !storeEntry.startsWith(`${storeEntryPrefix}_`)
+    ) {
+      continue;
+    }
+    const packageDir = path.join(
+      pnpmStoreDir,
+      storeEntry,
+      'node_modules',
+      ...packagePathSegments,
+    );
+    const packageEntry = resolvePackageEntry(packageDir);
+    if (packageEntry) {
+      return packageEntry;
+    }
+  }
+
+  return undefined;
+};
+
+export const loadAppDmg = async ({
+  directImport = () => import('appdmg'),
+  workspaceRoot = workspaceRootDir,
+  extraWorkspaceRoots = [],
+} = {}) => {
+  try {
+    const appdmgModule = await directImport();
+    return appdmgModule.default ?? appdmgModule;
+  } catch (error) {
+    if (error?.code !== 'ERR_MODULE_NOT_FOUND') {
+      throw error;
+    }
+    const appdmgEntry = [workspaceRoot, ...extraWorkspaceRoots]
+      .flatMap((root) => [
+        resolveNodeModulesPackageEntry({
+          packageName: 'appdmg',
+          workspaceRoot: root,
+        }),
+        resolvePnpmPackageEntry({
+          packageName: 'appdmg',
+          version: '0.6.6',
+          workspaceRoot: root,
+        }),
+      ])
+      .find(Boolean);
+    if (!appdmgEntry) {
+      throw error;
+    }
+    const appdmgModule = await import(pathToFileURL(appdmgEntry).href);
+    return appdmgModule.default ?? appdmgModule;
+  }
+};
+
+const runAppDmg = async ({ source, target, extraWorkspaceRoots = [] }) => {
   // `appdmg` (via `macos-alias`) loads a darwin-only native binding at
   // require time, so keep the import dynamic and gated to the darwin
-  // packaging path.
-  const { default: appdmg } = await import('appdmg');
+  // packaging path. CI can have the package in pnpm's store without a
+  // direct workspace symlink, so `loadAppDmg` falls back to that store path.
+  const appdmg = await loadAppDmg({ extraWorkspaceRoots });
   return new Promise((resolve, reject) => {
     const ee = appdmg({ source, target });
     ee.on('progress', (info) => {
@@ -1938,6 +2229,7 @@ export const buildStudioDmgArtifact = async ({
   baseName,
   iconPath,
   security = resolveMacPackagedAppSecurity({ platform: 'darwin' }),
+  stageDir,
 }) => {
   const dmgArtifactPath = path.join(artifactDir, `${baseName}.dmg`);
   await removeIfExists(dmgArtifactPath);
@@ -1958,7 +2250,11 @@ export const buildStudioDmgArtifact = async ({
     )}\n`,
   );
   try {
-    await runAppDmg({ source: specPath, target: dmgArtifactPath });
+    await runAppDmg({
+      source: specPath,
+      target: dmgArtifactPath,
+      extraWorkspaceRoots: stageDir ? [stageDir] : [],
+    });
   } finally {
     await removeIfExists(specPath);
   }
@@ -2007,6 +2303,57 @@ export const notarizePackagedMacApp = async ({
   return true;
 };
 
+export const buildWindowsNsisInstaller = async ({
+  arch,
+  baseName,
+  packagedAppPath,
+}) => {
+  // electron-builder's NSIS target only ships x64-compatible installers on
+  // Windows; arm64 NSIS support is not yet stable upstream. The Studio
+  // package-validation and release workflows also only exercise x64 for the
+  // Windows matrix, so we guard here rather than let electron-builder fail
+  // with a less clear error downstream.
+  if (arch !== 'x64') {
+    throw new Error(
+      `Windows NSIS packaging only supports x64 for now, received "${arch}".`,
+    );
+  }
+
+  const artifactName = buildWindowsNsisArtifactName(baseName);
+  const installerPath = path.join(artifactDir, artifactName);
+  const configPath = path.join(artifactDir, `${baseName}.nsis.config.json`);
+  await removeIfExists(installerPath);
+  await removeIfExists(`${installerPath}.blockmap`);
+  await fs.mkdir(artifactDir, { recursive: true });
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify(
+      buildWindowsNsisConfig({
+        artifactName,
+        iconPath: resolvePackagerIconPath('win32'),
+      }),
+      null,
+      2,
+    )}\n`,
+  );
+
+  try {
+    await run(
+      packageManagerCommand,
+      buildWindowsNsisInstallerArgs({
+        arch,
+        configPath,
+        packagedAppPath,
+      }),
+      { cwd: studioRootDir },
+    );
+  } finally {
+    await removeIfExists(configPath);
+  }
+
+  return installerPath;
+};
+
 export const packageStudioElectronApp = async ({
   version,
   platform = process.platform,
@@ -2048,8 +2395,12 @@ export const packageStudioElectronApp = async ({
 
   const packagedAppPath = packagedAppPaths[0];
   const artifactPath = path.join(artifactDir, `${baseName}.zip`);
+  const resourcesDir = await resolvePackagedResourcesDir(packagedAppPath);
 
-  await assertPortablePackagedNodeModules(packagedAppPath);
+  await Promise.all([
+    assertPortablePackagedNodeModules(packagedAppPath),
+    assertPackagedExternalResourcesUnpacked(resourcesDir),
+  ]);
   const packagedPayloadDir = await findPackagedAppPayloadDir(packagedAppPath);
   if (packagedPayloadDir) {
     await dedupePlaygroundStatic(path.join(packagedPayloadDir, 'node_modules'));
@@ -2060,15 +2411,16 @@ export const packageStudioElectronApp = async ({
   // at runtime to learn which provider / repo / cache dir to use. Must be
   // written before signing on macOS so it ends up inside the signed
   // bundle.
-  const resourcesDir = await findPackagedResourcesDir(packagedAppPath);
-  if (resourcesDir) {
-    await writeAppUpdateYmlIntoResources(resourcesDir);
-  }
+  await writeAppUpdateYmlIntoResources(resourcesDir);
 
   let dmgArtifactPath;
   if (platform === 'darwin') {
     const macAppBundlePath =
       await resolveMacPackagedAppBundlePath(packagedAppPath);
+    await assertMacNativeCodeArchitectures({
+      appPath: macAppBundlePath,
+      arch,
+    });
     await signPackagedMacApp({
       appPath: macAppBundlePath,
       security: macSecurity,
@@ -2085,6 +2437,7 @@ export const packageStudioElectronApp = async ({
       baseName,
       iconPath: resolvePackagerIconPath(platform),
       security: macSecurity,
+      stageDir,
     });
   }
 
@@ -2094,11 +2447,22 @@ export const packageStudioElectronApp = async ({
     artifactPath,
   });
 
+  let updaterArtifactPath = artifactPath;
+  let windowsInstallerArtifactPath;
+  if (platform === 'win32') {
+    windowsInstallerArtifactPath = await buildWindowsNsisInstaller({
+      arch,
+      baseName,
+      packagedAppPath,
+    });
+    updaterArtifactPath = windowsInstallerArtifactPath;
+  }
+
   // Emit the electron-updater channel manifest (latest-*.yml + beta-*.yml
   // when the version is prerelease) so the GitHub Release surfaces the
-  // sha512/size the autoUpdater needs to verify the zip.
+  // sha512/size the autoUpdater needs to verify the matching update artifact.
   const updateMetadata = await writeUpdateMetadataForArtifact({
-    artifactPath,
+    artifactPath: updaterArtifactPath,
     artifactDir,
     platform,
     version: normalizedVersion,
@@ -2107,6 +2471,11 @@ export const packageStudioElectronApp = async ({
   console.log(`Packaged Midscene Studio archive: ${artifactPath}`);
   if (dmgArtifactPath) {
     console.log(`Packaged Midscene Studio dmg: ${dmgArtifactPath}`);
+  }
+  if (windowsInstallerArtifactPath) {
+    console.log(
+      `Packaged Midscene Studio Windows installer: ${windowsInstallerArtifactPath}`,
+    );
   }
   for (const ymlPath of updateMetadata.writtenPaths) {
     console.log(`Wrote updater manifest: ${ymlPath}`);

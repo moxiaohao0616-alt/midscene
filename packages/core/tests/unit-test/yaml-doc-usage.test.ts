@@ -1,34 +1,39 @@
 import { Agent } from '@/agent';
 import { ScriptPlayer } from '@/yaml/player';
 import { interpolateEnvVars, parseYamlScript } from '@/yaml/utils';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, rs } from '@rstest/core';
 
 const createDocAgent = (overrides: Record<string, any> = {}) => {
   const agent = {
     reportFile: '/tmp/doc-report.html',
+    dump: { executions: [] },
     onTaskStartTip: undefined,
-    aiAct: vi.fn(async () => undefined),
-    aiTap: vi.fn(async () => undefined),
-    aiScroll: vi.fn(async () => undefined),
-    aiQuery: vi.fn(async () => ({ id: 'SKU-123', title: 'doc item' })),
-    aiNumber: vi.fn(async () => 42),
-    aiString: vi.fn(async () => 'SKU-123'),
-    aiBoolean: vi.fn(async () => true),
-    aiAsk: vi.fn(async () => 'answer'),
-    aiLocate: vi.fn(async () => ({
+    aiAct: rs.fn(async () => undefined),
+    aiTap: rs.fn(async () => undefined),
+    aiScroll: rs.fn(async () => undefined),
+    aiQuery: rs.fn(async () => ({ id: 'SKU-123', title: 'doc item' })),
+    aiNumber: rs.fn(async () => 42),
+    aiString: rs.fn(async () => 'SKU-123'),
+    aiBoolean: rs.fn(async () => true),
+    aiAsk: rs.fn(async () => 'answer'),
+    aiLocate: rs.fn(async () => ({
       rect: { x: 1, y: 2, width: 3, height: 4 },
     })),
-    aiWaitFor: vi.fn(async () => undefined),
-    aiAssert: vi.fn(async () => ({
+    aiWaitFor: rs.fn(async () => undefined),
+    aiAssert: rs.fn(async () => ({
       pass: true,
       thought: 'ok',
       message: 'passed',
     })),
-    evaluateJavaScript: vi.fn(async () => 'js-result'),
-    recordToReport: vi.fn(async () => undefined),
-    runAdbShell: vi.fn(async () => 'adb-result'),
-    callActionInActionSpace: vi.fn(async () => 'action-result'),
-    getActionSpace: vi.fn(async () => [
+    runGherkinScenario: rs.fn(async () => ({
+      steps: [],
+    })),
+    evaluateJavaScript: rs.fn(async () => 'js-result'),
+    recordToReport: rs.fn(async () => undefined),
+    recordErrorToReport: rs.fn(async () => undefined),
+    runAdbShell: rs.fn(async () => 'adb-result'),
+    callActionInActionSpace: rs.fn(async () => 'action-result'),
+    getActionSpace: rs.fn(async () => [
       { name: 'Hover', interfaceAlias: 'aiHover' },
       { name: 'DoubleClick', interfaceAlias: 'aiDoubleClick' },
       { name: 'RightClick', interfaceAlias: 'aiRightClick' },
@@ -37,7 +42,7 @@ const createDocAgent = (overrides: Record<string, any> = {}) => {
       { name: 'RunAdbShell', interfaceAlias: 'runAdbShell' },
       { name: 'RunWdaRequest', interfaceAlias: 'runWdaRequest' },
     ]),
-    _unstableLogContent: vi.fn(() => ({ logs: [] })),
+    _unstableLogContent: rs.fn(() => ({ logs: [] })),
     ...overrides,
   };
 
@@ -46,7 +51,7 @@ const createDocAgent = (overrides: Record<string, any> = {}) => {
 
 describe('YAML docs usage coverage', () => {
   afterEach(() => {
-    vi.restoreAllMocks();
+    rs.restoreAllMocks();
     Reflect.deleteProperty(process.env, 'DOC_ENABLED');
     Reflect.deleteProperty(process.env, 'DOC_HOST');
     Reflect.deleteProperty(process.env, 'DOC_TOPIC');
@@ -345,6 +350,31 @@ tasks:
     );
   });
 
+  it('rejects observer-only YAML options', async () => {
+    const script = parseYamlScript(`
+web:
+  url: about:blank
+tasks:
+  - name: Unsupported observer syntax
+    flow:
+      - aiAssert: a success toast appeared during submit
+        observe: submit-flow
+`);
+    const agent = createDocAgent();
+    const player = new ScriptPlayer(script, async () => ({
+      agent,
+      freeFn: [],
+    }));
+
+    await player.run();
+
+    expect(player.status).toBe('error');
+    expect(player.taskStatusList[0].error?.message).toContain(
+      '`observe` is not supported in YAML aiAssert',
+    );
+    expect(agent.aiAssert).not.toHaveBeenCalled();
+  });
+
   it('keeps named step results in output', async () => {
     const script = parseYamlScript(`
 web:
@@ -388,6 +418,37 @@ tasks:
     });
   });
 
+  it('runs a Gherkin scenario from YAML with cache disabled', async () => {
+    const script = parseYamlScript(`
+web:
+  url: about:blank
+tasks:
+  - name: Gherkin scenario
+    flow:
+      - runGherkinScenario: |
+          Scenario: Add a todo
+            Given the todo page is open
+            When I add "Buy milk"
+            Then the todo list contains "Buy milk"
+`);
+    const agent = createDocAgent();
+    const player = new ScriptPlayer(script, async () => ({
+      agent,
+      freeFn: [],
+    }));
+
+    await player.run();
+
+    expect(player.status).toBe('done');
+    expect(agent.runGherkinScenario).toHaveBeenCalledTimes(1);
+    expect(agent.runGherkinScenario).toHaveBeenCalledWith(
+      expect.stringContaining('Scenario: Add a todo'),
+      {
+        cacheable: false,
+      },
+    );
+  });
+
   it('continues to the next task when documented task continueOnError is enabled', async () => {
     const script = parseYamlScript(`
 web:
@@ -403,7 +464,7 @@ tasks:
         name: title
 `);
     const agent = createDocAgent({
-      aiAssert: vi.fn(async () => ({
+      aiAssert: rs.fn(async () => ({
         pass: false,
         thought: 'failed',
         message: 'doc failure',
@@ -420,6 +481,134 @@ tasks:
     expect(player.taskStatusList[0].status).toBe('error');
     expect(player.taskStatusList[1].status).toBe('done');
     expect(player.result.title).toBe('js-result');
+  });
+
+  it('records YAML runner step failures to the report', async () => {
+    const error = new Error('javascript gate failed');
+    const script = parseYamlScript(`
+web:
+  url: about:blank
+tasks:
+  - name: JavaScript gate
+    flow:
+      - javascript: throw new Error('javascript gate failed')
+        name: gate
+`);
+    const agent = createDocAgent({
+      evaluateJavaScript: rs.fn(async () => {
+        throw error;
+      }),
+    });
+    const player = new ScriptPlayer(script, async () => ({
+      agent,
+      freeFn: [],
+    }));
+
+    await player.run();
+
+    expect(player.status).toBe('error');
+    expect(player.taskStatusList[0].status).toBe('error');
+    expect(agent.recordErrorToReport).toHaveBeenCalledWith(
+      'YAML task failed - JavaScript gate',
+      {
+        error,
+        content: 'Step 0 failed while running YAML task "JavaScript gate".',
+      },
+    );
+  });
+
+  it('records later runner failures after an earlier recovered action failure', async () => {
+    const error = new Error('final javascript gate failed');
+    const script = parseYamlScript(`
+web:
+  url: about:blank
+tasks:
+  - name: Mixed failure task
+    flow:
+      - aiAct: Try a flaky action that recovers
+      - javascript: throw new Error('final javascript gate failed')
+        name: gate
+`);
+    const agent = createDocAgent({
+      aiAct: rs.fn(async () => {
+        agent.dump.executions.push({
+          id: 'recovered-agent-action',
+          logTime: Date.now(),
+          name: 'Try a flaky action that recovers',
+          tasks: [
+            {
+              taskId: 'recovered-failed-task',
+              type: 'Log',
+              status: 'failed',
+              errorMessage: 'transient agent failure',
+              executor: async () => {},
+            },
+          ],
+        });
+      }),
+      evaluateJavaScript: rs.fn(async () => {
+        throw error;
+      }),
+    });
+    const player = new ScriptPlayer(script, async () => ({
+      agent,
+      freeFn: [],
+    }));
+
+    await player.run();
+
+    expect(player.status).toBe('error');
+    expect(agent.aiAct).toHaveBeenCalledWith(
+      'Try a flaky action that recovers',
+      {},
+    );
+    expect(agent.recordErrorToReport).toHaveBeenCalledWith(
+      'YAML task failed - Mixed failure task',
+      {
+        error,
+        content: 'Step 1 failed while running YAML task "Mixed failure task".',
+      },
+    );
+  });
+
+  it('does not duplicate report errors when the failed action already produced one', async () => {
+    const error = new Error('agent action failed');
+    const script = parseYamlScript(`
+web:
+  url: about:blank
+tasks:
+  - name: Agent action
+    flow:
+      - aiAct: Click the broken button
+`);
+    const agent = createDocAgent({
+      aiAct: rs.fn(async () => {
+        agent.dump.executions.push({
+          id: 'failed-agent-action',
+          logTime: Date.now(),
+          name: 'Click the broken button',
+          tasks: [
+            {
+              taskId: 'failed-task',
+              type: 'Log',
+              status: 'failed',
+              errorMessage: error.message,
+              executor: async () => {},
+            },
+          ],
+        });
+        throw error;
+      }),
+    });
+    const player = new ScriptPlayer(script, async () => ({
+      agent,
+      freeFn: [],
+    }));
+
+    await player.run();
+
+    expect(player.status).toBe('error');
+    expect(agent.recordErrorToReport).not.toHaveBeenCalled();
   });
 
   it('dispatches documented Android and iOS platform-specific actions', async () => {
@@ -571,8 +760,8 @@ tasks:
     });
 
     const agent = createDocAgent({
-      aiString: vi.fn(async () => 'RUNTIME-123'),
-      aiQuery: vi.fn(async () => 'search-result'),
+      aiString: rs.fn(async () => 'RUNTIME-123'),
+      aiQuery: rs.fn(async () => 'search-result'),
     });
     const player = new ScriptPlayer(
       script,

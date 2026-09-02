@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import type { WebPageAgentOpt } from '@/web-element';
 import type {
   DeviceAction,
@@ -9,6 +10,8 @@ import type {
 } from '@midscene/core';
 import type {
   AbstractInterface,
+  DeviceFrameRef,
+  DeviceFrameSource,
   MjpegStreamHandle,
   MjpegStreamOptions,
 } from '@midscene/core/device';
@@ -20,7 +23,10 @@ import {
 } from '@midscene/shared/constants';
 import type { ElementInfo } from '@midscene/shared/extractor';
 import { treeToList } from '@midscene/shared/extractor';
-import { createImgBase64ByFormat } from '@midscene/shared/img';
+import {
+  createImgBase64ByFormat,
+  imageInfoOfBase64,
+} from '@midscene/shared/img';
 import { type DebugFunction, getDebug } from '@midscene/shared/logger';
 import {
   getElementInfosScriptContent,
@@ -36,6 +42,7 @@ import {
   judgeOrderSensitive,
   sanitizeXpaths,
 } from '../common/cache-helper';
+import { selectAllInputScript } from '../common/input-scripts';
 import {
   type KeyInput,
   type MouseButton,
@@ -50,6 +57,12 @@ export const BROWSER_NAVIGATION_ERROR_PATTERN =
 
 const CDP_SCREENCAST_QUALITY = 70;
 const CDP_SCREENCAST_EVERY_NTH_FRAME = 1;
+// JPEG encoders may round one edge after applying a device scale factor. A
+// couple of output pixels is harmless; a changed viewport is much larger.
+const MAX_FRAME_ASPECT_RATIO_PIXEL_ERROR = 2;
+// Empirical follow-up window for async UI paints after input actions.
+// The immediate refresh can happen before React/state transitions settle.
+const VISUAL_UPDATE_FOLLOWUP_DELAY_MS = 800;
 // Upper bound for the "wait for browser repaint" promise inside
 // flushPendingVisualUpdate so the call does not hang forever if the page
 // stops scheduling animation frames (e.g. backgrounded tab).
@@ -59,11 +72,18 @@ const DATA_URL_BASE64_PREFIX = /^data:image\/\w+;base64,/;
 type ScreencastFrameEvent = {
   data: string;
   sessionId: number;
+  metadata?: {
+    deviceWidth?: number;
+    deviceHeight?: number;
+  };
 };
 
-type ScreencastCdpSession = {
+type PageCdpSession = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   detach(): Promise<void>;
+};
+
+type ScreencastCdpSession = PageCdpSession & {
   on(
     event: 'Page.screencastFrame',
     handler: (event: ScreencastFrameEvent) => void,
@@ -88,6 +108,92 @@ function isClosedPageError(error: unknown) {
   );
 }
 
+function isTransientNavigationError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /execution context was destroyed|frame was detached|context was destroyed|net::ERR_ABORTED/i.test(
+    error.message,
+  );
+}
+
+function hasMatchingFrameAspectRatio(
+  frameSize: Size,
+  viewportSize: Size,
+): boolean {
+  if (
+    !Number.isFinite(frameSize.width) ||
+    !Number.isFinite(frameSize.height) ||
+    frameSize.width <= 0 ||
+    frameSize.height <= 0
+  ) {
+    // Older Chromium versions may omit useful metadata. Do not reject an
+    // otherwise usable frame solely because it cannot be diagnosed.
+    return true;
+  }
+
+  const expectedFrameHeight =
+    (frameSize.width * viewportSize.height) / viewportSize.width;
+  return (
+    Math.abs(frameSize.height - expectedFrameHeight) <=
+    MAX_FRAME_ASPECT_RATIO_PIXEL_ERROR
+  );
+}
+
+function isJpegStartOfFrameMarker(marker: number): boolean {
+  return (
+    (marker >= 0xc0 && marker <= 0xc3) ||
+    (marker >= 0xc5 && marker <= 0xc7) ||
+    (marker >= 0xc9 && marker <= 0xcb) ||
+    (marker >= 0xcd && marker <= 0xcf)
+  );
+}
+
+/**
+ * Reads JPEG dimensions without decoding pixels. CDP already sends JPEG for
+ * screencast frames, so this is cheap enough to validate every frame.
+ */
+function jpegSizeFromBase64(data: string): Size | undefined {
+  const bytes = Buffer.from(data.replace(DATA_URL_BASE64_PREFIX, ''), 'base64');
+  if (bytes.length < 10 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return undefined;
+  }
+
+  let offset = 2;
+  while (offset + 9 <= bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      offset++;
+      continue;
+    }
+    while (bytes[offset] === 0xff) offset++;
+    const marker = bytes[offset++];
+    if (
+      marker === undefined ||
+      marker === 0x00 ||
+      marker === 0xd8 ||
+      marker === 0xd9 ||
+      (marker >= 0xd0 && marker <= 0xd7)
+    ) {
+      continue;
+    }
+    if (offset + 2 > bytes.length) return undefined;
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) {
+      return undefined;
+    }
+    if (isJpegStartOfFrameMarker(marker)) {
+      return {
+        height: bytes.readUInt16BE(offset + 3),
+        width: bytes.readUInt16BE(offset + 5),
+      };
+    }
+    offset += segmentLength;
+  }
+
+  return undefined;
+}
+
 export class Page<
   AgentType extends 'puppeteer' | 'playwright',
   InterfaceType extends PuppeteerPage | PlaywrightPage,
@@ -101,17 +207,24 @@ export class Page<
   private onAfterInvokeAction?: AbstractInterface['afterInvokeAction'];
   private customActions?: DeviceAction<any>[];
   private enableTouchEventsInActionSpace: boolean;
-  private keyboardTypeDelay: number | undefined;
+  readonly keyboardTypeDelay: number | undefined;
+  readonly inputStrategy: WebPageAgentOpt['inputStrategy'];
   private puppeteerFileChooserSession?: CDPSession;
   private puppeteerFileChooserHandler?: (
     event: Protocol.Page.FileChooserOpenedEvent,
   ) => Promise<void>;
   private playwrightNetworkIdleWarningShown = false;
   private activeMjpegStream?: {
+    hasReceivedScreencastFrame: boolean;
+    expectedViewportSize?: Size;
     token: symbol;
     onFrame: MjpegStreamOptions['onFrame'];
     onError?: MjpegStreamOptions['onError'];
   };
+  private visualUpdateFlushInFlight: Promise<void> | null = null;
+  private visualUpdateFlushQueued = false;
+  private visualUpdateForceQueued = false;
+  private visualUpdateFollowupTimer?: ReturnType<typeof setTimeout>;
   interfaceType: AgentType;
 
   actionSpace(): DeviceAction[] {
@@ -161,6 +274,7 @@ export class Page<
     this.enableTouchEventsInActionSpace =
       opts?.enableTouchEventsInActionSpace ?? false;
     this.keyboardTypeDelay = opts?.keyboardTypeDelay;
+    this.inputStrategy = opts?.inputStrategy;
   }
 
   async evaluateJavaScript<T = any>(script: string): Promise<T> {
@@ -335,6 +449,7 @@ export class Page<
 
   async size(): Promise<Size> {
     if (this.viewportSize) return this.viewportSize;
+    /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
     const sizeInfo: Size = await this.evaluate(() => {
       return {
         width: window.innerWidth,
@@ -381,11 +496,7 @@ export class Page<
           'playwright screenshot failed, trying CDP fallback: %s',
           error,
         );
-        base64 = await this.screenshotBase64ByPlaywrightCdp(
-          page,
-          imgType,
-          quality,
-        );
+        base64 = await this.screenshotBase64ByPlaywrightCdp(imgType, quality);
       }
     } else {
       throw new Error('Unsupported page type for screenshot');
@@ -396,18 +507,10 @@ export class Page<
   }
 
   private async screenshotBase64ByPlaywrightCdp(
-    page: PlaywrightPage,
     imgType: 'jpeg' | 'png',
     quality?: number,
   ) {
-    const browserName = page.context().browser()?.browserType().name();
-    if (browserName && browserName !== 'chromium') {
-      throw new Error(
-        `CDP screenshot fallback requires Chromium-based browser, but current browser is "${browserName}".`,
-      );
-    }
-
-    const client = await page.context().newCDPSession(page);
+    const client = await this.createPageCdpSession('CDP screenshot fallback');
     try {
       const result = (await new Promise<{
         data: string;
@@ -442,27 +545,104 @@ export class Page<
     }
   }
 
-  private async createScreencastCdpSession(): Promise<ScreencastCdpSession> {
+  private async createPageCdpSession(
+    featureName: string,
+  ): Promise<PageCdpSession> {
     if (this.interfaceType === 'puppeteer') {
       const page = this.underlyingPage as PuppeteerPage;
-      return (await page.target().createCDPSession()) as ScreencastCdpSession;
+      // Puppeteer has exposed CDP sessions through both page.createCDPSession()
+      // and the historical page.target().createCDPSession() API. Support both
+      // here so CDP-backed actions work across Puppeteer versions and wrapped
+      // page objects that may only expose one of the two shapes.
+      const pageWithCdp = page as PuppeteerPage & {
+        createCDPSession?: () => Promise<unknown>;
+      };
+      if (typeof pageWithCdp.createCDPSession === 'function') {
+        return (await pageWithCdp.createCDPSession()) as unknown as PageCdpSession;
+      }
+
+      const target = page.target?.();
+      if (typeof target?.createCDPSession === 'function') {
+        return (await target.createCDPSession()) as unknown as PageCdpSession;
+      }
+
+      throw new Error(
+        `${featureName} requires a browser page with CDP session support.`,
+      );
     }
 
     const page = this.underlyingPage as PlaywrightPage;
     const browserName = page.context().browser()?.browserType().name();
     if (browserName && browserName !== 'chromium') {
       throw new Error(
-        `CDP screencast requires Chromium-based browser, but current browser is "${browserName}".`,
+        `${featureName} requires Chromium-based browser, but current browser is "${browserName}".`,
       );
     }
-    return (await page.context().newCDPSession(page)) as ScreencastCdpSession;
+
+    return (await page
+      .context()
+      .newCDPSession(page)) as unknown as PageCdpSession;
   }
 
-  async flushPendingVisualUpdate(): Promise<void> {
+  async waitForDomQuiet(opts?: {
+    quietMs?: number;
+    timeoutMs?: number;
+    target?: ElementInfo;
+  }): Promise<void> {
+    const quietMs = opts?.quietMs ?? 100;
+    const timeoutMs = opts?.timeoutMs ?? 500;
+    const targetCenter = opts?.target?.center;
+    try {
+      /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
+      await this.evaluate(
+        ([q, total, center]: [number, number, [number, number] | undefined]) =>
+          new Promise<void>((resolve) => {
+            let settleTimer: ReturnType<typeof setTimeout> | undefined;
+            const done = () => {
+              obs.disconnect();
+              clearTimeout(hardTimer);
+              if (settleTimer) clearTimeout(settleTimer);
+              resolve();
+            };
+            const target =
+              center && Number.isFinite(center[0]) && Number.isFinite(center[1])
+                ? document.elementFromPoint(center[0], center[1])
+                : null;
+            const observeRoot =
+              target?.closest('form') ?? target?.parentElement ?? document.body;
+            const obs = new MutationObserver(() => {
+              if (settleTimer) clearTimeout(settleTimer);
+              settleTimer = setTimeout(done, q);
+            });
+            obs.observe(observeRoot, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              characterData: true,
+            });
+            const hardTimer = setTimeout(done, total);
+          }),
+        [quietMs, timeoutMs, targetCenter],
+      );
+    } catch (error) {
+      debugPage('waitForDomQuiet failed: %s', error);
+    }
+  }
+
+  async flushPendingVisualUpdate(force = false): Promise<void> {
     const activeStream = this.activeMjpegStream;
-    if (!activeStream) return;
+    // A direct screenshot is normally only the fallback for an idle page that
+    // has not emitted its first CDP screencast frame. Navigation actions force
+    // one final screenshot because Chromium may emit a white transition frame
+    // during reload and then no more frames once the settled page is idle.
+    // Other actions avoid mixing screenshots with screencast frames because
+    // headed browsers can report different viewport sizes for the two paths.
+    if (!activeStream || (!force && activeStream.hasReceivedScreencastFrame)) {
+      return;
+    }
 
     try {
+      /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
       await this.evaluate(
         (timeoutMs: number) =>
           new Promise<void>((resolve) => {
@@ -477,8 +657,38 @@ export class Page<
           }),
         FLUSH_VISUAL_UPDATE_TIMEOUT_MS,
       );
+      if (
+        this.activeMjpegStream?.token !== activeStream.token ||
+        (!force && activeStream.hasReceivedScreencastFrame)
+      ) {
+        return;
+      }
       const dataUrl = await this.screenshotBase64();
-      if (this.activeMjpegStream?.token !== activeStream.token) return;
+      if (
+        this.activeMjpegStream?.token !== activeStream.token ||
+        (!force && activeStream.hasReceivedScreencastFrame)
+      ) {
+        return;
+      }
+      const frameSize = await imageInfoOfBase64(dataUrl);
+      if (
+        activeStream.expectedViewportSize &&
+        !hasMatchingFrameAspectRatio(
+          frameSize,
+          activeStream.expectedViewportSize,
+        )
+      ) {
+        throw new Error(
+          `Screenshot fallback aspect ratio mismatch: expected viewport ${activeStream.expectedViewportSize.width}x${activeStream.expectedViewportSize.height}, received ${frameSize.width}x${frameSize.height}`,
+        );
+      }
+      debugPage(
+        'screencast fallback screenshot size %dx%d for viewport %dx%d',
+        frameSize.width,
+        frameSize.height,
+        activeStream.expectedViewportSize?.width ?? 0,
+        activeStream.expectedViewportSize?.height ?? 0,
+      );
       // MjpegStreamFrame.data is contractually bare base64; screenshotBase64()
       // returns a `data:image/...;base64,...` URL, so strip the prefix here.
       activeStream.onFrame({
@@ -487,8 +697,60 @@ export class Page<
       });
     } catch (error) {
       debugPage('screencast visual refresh failed: %s', error);
+      if (isTransientNavigationError(error) && !isClosedPageError(error)) {
+        return;
+      }
       activeStream.onError?.(error);
     }
+  }
+
+  private queuePendingVisualUpdate(force = false): void {
+    if (!this.activeMjpegStream) {
+      return;
+    }
+
+    this.visualUpdateForceQueued ||= force;
+    if (this.visualUpdateFlushInFlight) {
+      this.visualUpdateFlushQueued = true;
+      return;
+    }
+
+    const flushTask = (async () => {
+      do {
+        this.visualUpdateFlushQueued = false;
+        const forceRefresh = this.visualUpdateForceQueued;
+        this.visualUpdateForceQueued = false;
+        await this.flushPendingVisualUpdate(forceRefresh);
+      } while (this.visualUpdateFlushQueued);
+    })()
+      .catch((error) => {
+        debugPage('scheduled screencast visual refresh failed: %s', error);
+      })
+      .finally(() => {
+        if (this.visualUpdateFlushInFlight === flushTask) {
+          this.visualUpdateFlushInFlight = null;
+        }
+        this.visualUpdateFlushQueued = false;
+        this.visualUpdateForceQueued = false;
+      });
+
+    this.visualUpdateFlushInFlight = flushTask;
+  }
+
+  schedulePendingVisualUpdate(force = false): void {
+    if (!this.activeMjpegStream) {
+      return;
+    }
+
+    this.queuePendingVisualUpdate(force);
+
+    if (this.visualUpdateFollowupTimer) {
+      clearTimeout(this.visualUpdateFollowupTimer);
+    }
+    this.visualUpdateFollowupTimer = setTimeout(() => {
+      this.visualUpdateFollowupTimer = undefined;
+      this.queuePendingVisualUpdate(force);
+    }, VISUAL_UPDATE_FOLLOWUP_DELAY_MS);
   }
 
   async startMjpegStream(
@@ -498,8 +760,13 @@ export class Page<
     if (typeof this.underlyingPage.bringToFront === 'function') {
       await this.underlyingPage.bringToFront();
     }
-    const client = await this.createScreencastCdpSession();
+    const client = (await this.createPageCdpSession(
+      'CDP screencast',
+    )) as ScreencastCdpSession;
     let stopped = false;
+    let expectedViewportSize: Size | undefined;
+    let hasLoggedScreencastFrameSize = false;
+    let hasReportedInvalidScreencastFrame = false;
     const streamToken = Symbol('mjpeg-stream');
 
     const reportStreamError = (error: unknown) => {
@@ -513,13 +780,64 @@ export class Page<
     const handleFrame = (event: ScreencastFrameEvent) => {
       void (async () => {
         if (stopped) return;
-        try {
-          onFrame({
-            data: event.data,
-            contentType: 'image/jpeg',
-          });
-        } catch (error) {
-          reportStreamError(error);
+        const compositorFrameSize = {
+          width: event.metadata?.deviceWidth ?? 0,
+          height: event.metadata?.deviceHeight ?? 0,
+        };
+        // JPEG dimensions are what the preview actually displays. Prefer
+        // them over compositor metadata: the latter may be stale while a
+        // viewport resize or navigation is in flight.
+        const frameSize = jpegSizeFromBase64(event.data) ?? compositorFrameSize;
+        const isExpectedFrame =
+          !expectedViewportSize ||
+          hasMatchingFrameAspectRatio(frameSize, expectedViewportSize);
+
+        if (!hasLoggedScreencastFrameSize && expectedViewportSize) {
+          hasLoggedScreencastFrameSize = true;
+          debugPage(
+            'CDP screencast JPEG size %dx%d (metadata %dx%d) for viewport %dx%d',
+            frameSize.width,
+            frameSize.height,
+            compositorFrameSize.width,
+            compositorFrameSize.height,
+            expectedViewportSize.width,
+            expectedViewportSize.height,
+          );
+        }
+
+        if (!isExpectedFrame) {
+          if (!hasReportedInvalidScreencastFrame) {
+            hasReportedInvalidScreencastFrame = true;
+            debugPage(
+              'CDP screencast frame aspect ratio mismatch: expected viewport %dx%d, received %dx%d; using screenshot fallback until the screencast recovers',
+              expectedViewportSize?.width ?? 0,
+              expectedViewportSize?.height ?? 0,
+              frameSize.width,
+              frameSize.height,
+            );
+            // Do not turn a single malformed CDP frame into a terminal stream
+            // error. Chromium keeps the last decoded multipart image when a
+            // response ends, so the renderer may never fire <img onError> or
+            // remount the stream. Keep the connection alive and push a direct
+            // screenshot instead; a later valid CDP frame will resume the
+            // low-cost screencast path automatically.
+            if (this.activeMjpegStream?.token === streamToken) {
+              this.activeMjpegStream.hasReceivedScreencastFrame = false;
+            }
+            this.schedulePendingVisualUpdate();
+          }
+        } else {
+          if (this.activeMjpegStream?.token === streamToken) {
+            this.activeMjpegStream.hasReceivedScreencastFrame = true;
+          }
+          try {
+            onFrame({
+              data: event.data,
+              contentType: 'image/jpeg',
+            });
+          } catch (error) {
+            reportStreamError(error);
+          }
         }
 
         try {
@@ -548,6 +866,10 @@ export class Page<
       if (this.activeMjpegStream?.token === streamToken) {
         this.activeMjpegStream = undefined;
       }
+      if (this.visualUpdateFollowupTimer) {
+        clearTimeout(this.visualUpdateFollowupTimer);
+        this.visualUpdateFollowupTimer = undefined;
+      }
       signal?.removeEventListener('abort', abortHandler);
       removeFrameListener();
       await client.send('Page.stopScreencast').catch((error) => {
@@ -565,6 +887,7 @@ export class Page<
     try {
       client.on('Page.screencastFrame', handleFrame);
       this.activeMjpegStream = {
+        hasReceivedScreencastFrame: false,
         token: streamToken,
         onFrame,
         onError,
@@ -579,6 +902,10 @@ export class Page<
       await client.send('Page.enable');
       try {
         const { width, height } = await this.size();
+        expectedViewportSize = { width, height };
+        if (this.activeMjpegStream?.token === streamToken) {
+          this.activeMjpegStream.expectedViewportSize = expectedViewportSize;
+        }
         await client.send('Emulation.setVisibleSize', { width, height });
       } catch (error) {
         debugPage('CDP screencast visible size sync failed: %s', error);
@@ -586,6 +913,12 @@ export class Page<
       await client.send('Page.startScreencast', {
         format: 'jpeg',
         quality: CDP_SCREENCAST_QUALITY,
+        ...(expectedViewportSize
+          ? {
+              maxWidth: expectedViewportSize.width,
+              maxHeight: expectedViewportSize.height,
+            }
+          : {}),
         everyNthFrame: CDP_SCREENCAST_EVERY_NTH_FRAME,
       });
 
@@ -595,13 +928,41 @@ export class Page<
       // attached subscribers staring at a blank canvas. Force-push one
       // manual screenshot so producer.lastFrame is populated before any
       // /mjpeg subscriber connects.
-      void this.flushPendingVisualUpdate();
+      this.schedulePendingVisualUpdate();
 
       return { stop };
     } catch (error) {
       await stop();
       throw error;
     }
+  }
+
+  /**
+   * Continuous frame source for UI observation, backed by the same CDP
+   * screencast used for MJPEG previews. Frames arrive as JPEG base64 already,
+   * so `decode()` is a pass-through. Measured cost of an active screencast is
+   * ~1% host CPU with no impact on action/screenshot latency, so this is
+   * always available on web (no opt-in needed).
+   */
+  async openFrameSource(): Promise<DeviceFrameSource> {
+    let latest: DeviceFrameRef | null = null;
+    const handle = await this.startMjpegStream({
+      onFrame: (frame) => {
+        latest = {
+          ref: `data:${frame.contentType ?? 'image/jpeg'};base64,${frame.data}`,
+          capturedAt: Date.now(),
+        };
+      },
+      onError: (error) => {
+        debugPage('frame source screencast error: %s', error);
+      },
+    });
+    return {
+      latest: () => latest,
+      // Screencast frames are already data URLs — no deferred decode cost.
+      decode: async (refs) => refs.map((frameRef) => frameRef.ref as string),
+      stop: () => handle.stop(),
+    };
   }
 
   async url(): Promise<string> {
@@ -690,12 +1051,29 @@ export class Page<
 
   get keyboard() {
     return {
-      type: async (text: string) => {
-        const delay = this.keyboardTypeDelay;
+      type: async (text: string, options?: { delay?: number }) => {
+        const effectiveDelay = options?.delay ?? this.keyboardTypeDelay;
         debugPage(
-          `keyboard type ${text}${delay !== undefined ? ` (delay: ${delay}ms)` : ''}`,
+          `keyboard type ${text}${effectiveDelay !== undefined ? ` (delay: ${effectiveDelay}ms)` : ''}`,
         );
-        return this.underlyingPage.keyboard.type(text, { delay });
+        return this.underlyingPage.keyboard.type(text, {
+          delay: effectiveDelay,
+        });
+      },
+      insertText: async (text: string) => {
+        debugPage(`keyboard insert text ${text}`);
+        if (this.interfaceType === 'playwright') {
+          return (this.underlyingPage as PlaywrightPage).keyboard.insertText(
+            text,
+          );
+        }
+
+        const client = await this.createPageCdpSession('bulk text input');
+        try {
+          await client.send('Input.insertText', { text });
+        } finally {
+          await client.detach().catch(() => undefined);
+        }
       },
       press: async (
         action:
@@ -723,37 +1101,57 @@ export class Page<
     };
   }
 
+  private async selectAllByCdp(): Promise<void> {
+    const client = await this.createPageCdpSession('clearInput');
+    try {
+      // Use the browser editing command instead of Modifier+A. Playwright's
+      // Chromium input layer derives the browser platform from
+      // Browser.getVersion().userAgent, while Modifier+A shortcuts are often
+      // chosen from local process.platform. If a Linux browser is launched with
+      // a macOS browser-level UA, Chromium treats select-all as Cmd+A instead
+      // of Ctrl+A, so the local-platform shortcut can fail.
+      await client.send('Input.dispatchKeyEvent', {
+        type: 'rawKeyDown',
+
+        commands: ['selectAll'],
+      });
+      await client.send('Input.dispatchKeyEvent', {
+        type: 'keyUp',
+      });
+    } finally {
+      await client.detach().catch(() => undefined);
+    }
+  }
+
+  async selectAllInput(element?: ElementInfo): Promise<void> {
+    if (!element) {
+      throw new Error('Bulk replace input requires a target element');
+    }
+    await this.mouse.click(element.center[0], element.center[1]);
+    const selected = await this.evaluate<boolean>(selectAllInputScript);
+    if (!selected) {
+      await this.selectAllByCdp();
+    }
+  }
+
   async clearInput(element?: ElementInfo): Promise<void> {
     const backspace = async () => {
       await sleep(100);
       await this.keyboard.press([{ key: 'Backspace' }]);
     };
 
-    const isMac = process.platform === 'darwin';
     debugPage('clearInput begin');
-    if (isMac) {
-      if (this.interfaceType === 'puppeteer') {
-        // https://github.com/segment-boneyard/nightmare/issues/810#issuecomment-452669866
-        element &&
-          (await this.mouse.click(element.center[0], element.center[1], {
-            count: 3,
-          }));
-        await backspace();
-      }
 
-      element && (await this.mouse.click(element.center[0], element.center[1]));
-      await this.underlyingPage.keyboard.down('Meta');
-      await this.underlyingPage.keyboard.press('a');
-      await this.underlyingPage.keyboard.up('Meta');
+    element && (await this.mouse.click(element.center[0], element.center[1]));
+    try {
+      await this.selectAllByCdp();
       await backspace();
-    } else {
-      element && (await this.mouse.click(element.center[0], element.center[1]));
-      await this.underlyingPage.keyboard.down('Control');
-      await this.underlyingPage.keyboard.press('a');
-      await this.underlyingPage.keyboard.up('Control');
-      await backspace();
+    } catch (error) {
+      debugPage('clearInput cdp selectAll failed', error);
+      throw error;
+    } finally {
+      debugPage('clearInput end');
     }
-    debugPage('clearInput end');
   }
 
   private everMoved = false;
@@ -790,6 +1188,7 @@ export class Page<
   }
 
   async scrollUp(distance?: number, startingPoint?: Point): Promise<void> {
+    /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
     const innerHeight = await this.evaluate(() => window.innerHeight);
     const scrollDistance = distance || innerHeight * 0.7;
     await this.moveToPointBeforeScroll(startingPoint);
@@ -797,6 +1196,7 @@ export class Page<
   }
 
   async scrollDown(distance?: number, startingPoint?: Point): Promise<void> {
+    /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
     const innerHeight = await this.evaluate(() => window.innerHeight);
     const scrollDistance = distance || innerHeight * 0.7;
     await this.moveToPointBeforeScroll(startingPoint);
@@ -804,6 +1204,7 @@ export class Page<
   }
 
   async scrollLeft(distance?: number, startingPoint?: Point): Promise<void> {
+    /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
     const innerWidth = await this.evaluate(() => window.innerWidth);
     const scrollDistance = distance || innerWidth * 0.7;
     await this.moveToPointBeforeScroll(startingPoint);
@@ -811,6 +1212,7 @@ export class Page<
   }
 
   async scrollRight(distance?: number, startingPoint?: Point): Promise<void> {
+    /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
     const innerWidth = await this.evaluate(() => window.innerWidth);
     const scrollDistance = distance || innerWidth * 0.7;
     await this.moveToPointBeforeScroll(startingPoint);
@@ -864,15 +1266,14 @@ export class Page<
   async stopLoading(): Promise<void> {
     debugPage('stop loading');
     if (this.interfaceType === 'puppeteer') {
-      const client = await (this.underlyingPage as PuppeteerPage)
-        .target()
-        .createCDPSession();
+      const client = await this.createPageCdpSession('stopLoading');
       try {
         await client.send('Page.stopLoading');
       } finally {
         await client.detach();
       }
     } else if (this.interfaceType === 'playwright') {
+      /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
       await (this.underlyingPage as PlaywrightPage).evaluate(() =>
         window.stop(),
       );
@@ -883,6 +1284,7 @@ export class Page<
 
   async navigationState(): Promise<{ isLoading: boolean }> {
     try {
+      /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
       const readyState = await this.evaluate(() => document.readyState);
       return { isLoading: readyState !== 'complete' };
     } catch (error) {
@@ -1005,23 +1407,9 @@ export class Page<
       detach(): Promise<void>;
     };
 
-    let client: TouchClient;
-    if (this.interfaceType === 'puppeteer') {
-      const page = this.underlyingPage as PuppeteerPage;
-      client = (await page.target().createCDPSession()) as TouchClient;
-    } else if (this.interfaceType === 'playwright') {
-      const page = this.underlyingPage as PlaywrightPage;
-      // CDP is Chromium-only; Firefox/WebKit do not support it
-      const browserName = page.context().browser()?.browserType().name();
-      if (browserName && browserName !== 'chromium') {
-        throw new Error(
-          `Pinch gesture requires Chromium-based browser, but current browser is "${browserName}". CDP touch events are not supported in Firefox/WebKit.`,
-        );
-      }
-      client = (await page.context().newCDPSession(page)) as TouchClient;
-    } else {
-      return;
-    }
+    const client = (await this.createPageCdpSession(
+      'Pinch gesture',
+    )) as TouchClient;
 
     try {
       await client.send('Input.dispatchTouchEvent', {
@@ -1061,13 +1449,13 @@ export class Page<
     }
   }
 
-  private async ensurePuppeteerFileChooserSession(
-    page: PuppeteerPage,
-  ): Promise<CDPSession> {
+  private async ensurePuppeteerFileChooserSession(): Promise<CDPSession> {
     if (this.puppeteerFileChooserSession) {
       return this.puppeteerFileChooserSession;
     }
-    const session = await page.target().createCDPSession();
+    const session = (await this.createPageCdpSession(
+      'Puppeteer file chooser',
+    )) as unknown as CDPSession;
     await session.send('Page.enable');
     await session.send('DOM.enable');
     await session.send('Page.setInterceptFileChooserDialog', { enabled: true });
@@ -1086,8 +1474,7 @@ export class Page<
       );
     }
 
-    const page = this.underlyingPage as PuppeteerPage;
-    const session = await this.ensurePuppeteerFileChooserSession(page);
+    const session = await this.ensurePuppeteerFileChooserSession();
     if (this.puppeteerFileChooserHandler) {
       session.off('Page.fileChooserOpened', this.puppeteerFileChooserHandler);
     }
@@ -1180,7 +1567,15 @@ export function forceClosePopup(
 
     if (!page.isClosed()) {
       try {
-        await page.goto(url);
+        // A target=_blank navigation (for example Baidu's Map link) is
+        // redirected back into the preview tab. Waiting for the target page's
+        // full `load` event keeps the interaction pending for up to Puppeteer's
+        // default 30 seconds on pages with long-lived resources. DOM content is
+        // enough for the preview to switch to the new page.
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: 10_000,
+        });
       } catch (error) {
         debugProfile(`failed to goto ${url}, error: ${error}`);
       }
@@ -1198,9 +1593,20 @@ export function forceClosePopup(
  *
  * Adds a style tag with CSS rules to make all select elements use base-select appearance.
  */
+// Track pages that already have the select-rendering style wired up so the
+// immediate injection and the `load` listener are only registered once per page,
+// even if multiple agents are created for the same page.
+const forceSelectRenderingPages = new WeakSet<object>();
+
 export function forceChromeSelectRendering(
   page: PuppeteerPage | PlaywrightPage,
 ): void {
+  // Only inject once per page to avoid stacking duplicate `load` listeners.
+  if (forceSelectRenderingPages.has(page)) {
+    return;
+  }
+  forceSelectRenderingPages.add(page);
+
   // Force Chrome to render select elements using base-select appearance
   // Reference: https://developer.chrome.com/blog/a-customizable-select
   const styleContent = `
@@ -1214,6 +1620,7 @@ select {
 
   const injectStyle = async () => {
     try {
+      /* istanbul ignore next -- closure is serialized to the browser realm via page.evaluate, where istanbul's cov_* counter does not exist */
       await (page as PuppeteerPage & PlaywrightPage).evaluate(
         ({ id, content }: { id: string; content: string }) => {
           if (document.getElementById(id)) return;

@@ -1,11 +1,11 @@
 export const EN_US = {
   // Banner - New Badge
-  newBadge: 'Control Any Platform with Midscene Skills',
+  newBadge: 'Now supports the DeepSeek V4 vision model',
   changelogLink: 'Details',
 
   // Banner - Title
-  heroTitle: 'Midscene.js',
-  heroSubtitle: 'AI-powered, vision-driven UI automation for every platform.',
+  heroTitle: 'Midscene.js\nthe GUI Agent\nfor E2E Testing',
+  heroSubtitle: 'AI-powered vision. Cross-platform. Batteries included.',
 
   // Banner - Stats
   githubStars: 'Github Stars',
@@ -14,15 +14,19 @@ export const EN_US = {
   // Banner - CTA Buttons
   introduction: 'Documentation',
   whatsNew: 'Showcases',
+  benchmark: 'Pass@1',
+  completion: 'Completion',
 
   // Feature Sections - CLIENTS
   clientsTitle: 'Platforms',
   clientsHeading: `Web, PC, Mobile,
 and more`,
   clientsDesc1:
-    'Control browsers and mobile apps with natural language across multiple platforms',
-  clientsDesc2: 'Unified API design for seamless cross-platform automation',
-  clientsDesc3: 'Supports Android, iOS, HarmonyOS, Linux, macOS, and Windows',
+    'Test and automate with natural language across web, mobile, and desktop',
+  clientsDesc2:
+    'One unified API and test suite — the same way on every platform',
+  clientsDesc3:
+    'Reaches what selectors cannot — unlabeled elements, canvas, native apps, and cross-origin frames',
 
   // Feature Sections - Platforms
   platformWeb: 'Web',
@@ -30,62 +34,69 @@ and more`,
   platformMobile: 'Mobile',
   platformAnyInterface: 'Any Interface',
   platformWebDesc:
-    'Integrate with Puppeteer or Playwright, or use Bridge Mode to control desktop browsers.',
+    'Add Midscene to your Playwright or Puppeteer tests, or drive your own Chrome via Bridge Mode.',
   platformPCDesc:
-    'Control desktop applications on macOS, Windows, and Linux with natural language.',
+    'Test and automate desktop apps on macOS, Windows, and Linux with natural language.',
   platformMobileDesc:
-    'Control Android, iOS, and HarmonyOS devices with natural language automation.',
+    'Test and automate Android, iOS, and HarmonyOS apps on real devices and simulators.',
   platformAnyInterfaceDesc:
-    'Automation on any interface, beyond DOM / Accessibility limitations.',
+    'Automate any interface you can screenshot — beyond DOM and accessibility limits.',
 
   // Feature Sections - MODELS
   modelsTitle: 'MODEL STRATEGY',
-  modelsHeading: `Vision Models
- Multi-model combination
- Adapt open-source models`,
-  modelsDesc1: 'Vision models boost action precision',
-  modelsDesc2: 'Multi-model setups raise completion rates',
-  modelsDesc3: 'Open-source options that still perform',
+  modelsHeading: 'Pure vision at the core',
+  modelsDesc1: 'Works from screenshots — no selectors or annotations',
+  modelsDesc2: 'Start with one model; add specialists for complex tasks',
+  modelsDesc3: 'Choose from supported models, including self-hosted options',
 
   // Model Cards
   modelSeedName: 'Doubao Seed',
   modelSeedDesc:
-    'Doubao Seed vision model optimized for visual understanding and UI element recognition with excellent performance.',
-  modelQwenName: 'qwen3.7-plus',
-  modelQwenDesc:
-    'Qwen vision-language model with high-quality image understanding and UI element recognition at competitive pricing.',
-  modelGeminiName: 'gemini-3.5-flash',
-  modelGeminiDesc:
-    'Advanced Gemini multimodal model with powerful vision capabilities and comprehensive UI automation support.',
+    'Strong visual grounding for reliable element location — a solid default for Midscene.',
+  modelSupportedName: 'Multiple model options',
+  modelSupportedDesc:
+    'Works with Qwen, GPT, Gemini, Kimi, and more — choose what fits your needs.',
+  modelDeepSeekName: 'deepseek-v4-flash-vision-exp',
+  modelDeepSeekDesc:
+    'Extremely fast visual grounding, but less reliable on complex interfaces.',
   modelMultiModelName: 'Multi-model combo',
   modelMultiModelDesc:
-    'Supports using different models for planning and interaction to improve task completion rates',
+    'Pair a planning model with a vision model to raise task completion rates.',
 
   // Feature Sections - DEBUGGING
-  debuggingTitle: 'DEVELOPER EXPERIENCE',
-  debuggingHeading: `Rich APIs
-& Tools`,
-  debuggingDesc1: 'Practical APIs to control automation flows and run strategy',
+  debuggingTitle: 'TESTING TOOLKIT',
+  debuggingHeading: `Ready-to-use
+UI testing toolkit`,
+  debuggingDesc1: 'Practical APIs to script tests and control automation flows',
   debuggingDesc2: 'Supports extending your own UI action agents',
-  debuggingDesc3: 'Helps developers ship UI automation tasks faster',
+  debuggingDesc3: 'Lowers the maintenance cost of your UI tests',
+
+  // Feature Sections - BENCHMARKS
+  benchmarksTitle: 'EVALUATION',
+  benchmarksHeading: 'Benchmarks',
+  benchmarksDesc:
+    "Explore Midscene's results on AndroidWorld, MobileWorld, and AppControlBench.",
 
   // Feature Cards
   featureRichAPIs: 'Rich APIs',
   featureRichAPIsDesc:
-    'Enables both smart automation workflows and fine-grained atomic control.',
-  featureSkillsMcp: 'Skills & MCP',
-  featureSkillsMcpDesc:
-    'Drop-in Agent Skills for AI coding tools, plus an MCP Server for model collaboration.',
+    'Auto-planning for whole flows, plus atomic APIs like aiTap and aiAssert for precise tests.',
+  featureSkills: 'Skills',
+  featureSkillsDesc:
+    'Drop-in Skills let AI coding agents test your UI through Midscene CLIs.',
   featureReportsPlayground: 'Reports & Playground',
   featureReportsPlaygroundDesc:
-    'Provides intuitive visualization reports to help developers trace back the automation process',
+    'Replay every step in a visual report, and try ideas fast in the playground.',
   featureFlexibleIntegration: 'Flexible Integration',
   featureFlexibleIntegrationDesc:
-    'Supports using Yaml to write automation flows, supports custom Agent execution strategies',
+    'Write flows in YAML, integrate with your test runner, and customize agent execution strategies.',
   featureRichAPIsLink: '/api',
-  featureSkillsMcpLink: '/skills',
-  featureReportsPlaygroundLink: '/quick-experience',
+  featureSkillsLink: '/skills',
+  featureReportsPlaygroundLink: '/quick-start#chrome-extension',
   featureFlexibleIntegrationLink: '/automate-with-scripts-in-yaml',
+  featureBenchmarkLink: '/android-world-benchmark-report',
+  featureMobileWorldBenchmarkLink: '/mobile-world-benchmark-report',
+  featureAppControlBenchLink: '/app-control-bench-report',
 
   // View All APIs
   apiMoreLink: 'View All APIs',
@@ -93,10 +104,12 @@ and more`,
     'Explore the complete API documentation for more automation capabilities.',
 
   // Who is Using
+  whoIsUsingEyebrow: 'USERS',
   whoIsUsingTitle: 'Who is using Midscene',
   userVolcengine: 'Volcengine',
   userDouyin: 'Douyin',
   userAlibaba: 'Alibaba',
+  userCtrip: 'Ctrip',
   userXiaomi: 'Xiaomi',
   userIqiyi: 'iQIYI',
   userLark: 'Lark',
@@ -107,10 +120,16 @@ and more`,
   userDoubao: 'Doubao',
   userDongchedi: 'Dongchedi',
 
+  // Bottom CTA and Footer
+  bottomCtaTitle: 'The GUI Agent for E2E Testing',
+  licenseNotice:
+    'Midscene is free and open source software released under the MIT license.',
+  copyrightNotice: '© 2024-present ByteDance Inc. and its affiliates.',
+
   // Links
   multiModelStrategyLink: '/model-strategy#advanced-combining-multiple-models',
-  platformWebLink: '/quick-experience.html',
-  platformPCLink: '/quick-experience.html',
-  platformMobileLink: '/android-introduction.html',
+  platformWebLink: '/quick-start#chrome-extension',
+  platformPCLink: '/quick-start#chrome-extension',
+  platformMobileLink: '/platforms/android.html',
   platformAnyInterfaceLink: '/integrate-with-any-interface.html',
 } as const;

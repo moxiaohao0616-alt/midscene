@@ -3,9 +3,12 @@ import type {
   DeviceAction,
   ExecutionDump,
 } from '@midscene/core';
+import type { TModelConfig } from '@midscene/shared/env';
 import { parseStructuredParams } from '../common';
 import type {
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeResult,
+  PlaygroundRecorderEvent,
   PlaygroundRecorderEventsResult,
   PlaygroundRecorderSourceKind,
   PlaygroundRecorderStartResult,
@@ -14,7 +17,12 @@ import type {
   PlaygroundSessionTarget,
 } from '../platform';
 import type { PlaygroundRuntimeInfo } from '../runtime-metadata';
-import type { ExecutionOptions, FormValue, ValidationResult } from '../types';
+import type {
+  ExecutionOptions,
+  FormValue,
+  PlaygroundReportRef,
+  ValidationResult,
+} from '../types';
 import { BasePlaygroundAdapter } from './base';
 
 export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
@@ -25,6 +33,18 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
     executionDump?: ExecutionDump,
   ) => void;
   private pollingIntervalId?: ReturnType<typeof setInterval>;
+
+  private resolveReportUrl(report: PlaygroundReportRef | null | undefined) {
+    if (!report || !this.serverUrl) return report;
+    const resolved = {
+      ...report,
+      url: new URL(report.url, this.serverUrl).toString(),
+    };
+    if (report.replayUrl) {
+      resolved.replayUrl = new URL(report.replayUrl, this.serverUrl).toString();
+    }
+    return resolved;
+  }
 
   constructor(serverUrl: string) {
     super();
@@ -186,6 +206,9 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
       }
 
       const result = await response.json();
+      if (result?.report) {
+        result.report = this.resolveReportUrl(result.report);
+      }
 
       return result;
     } catch (error) {
@@ -212,6 +235,7 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
       { key: 'screenshotIncluded', value: options.screenshotIncluded },
       { key: 'domIncluded', value: options.domIncluded },
       { key: 'deviceOptions', value: options.deviceOptions },
+      { key: 'reportDisplay', value: options.reportDisplay },
       { key: 'params', value: value.params },
     ] as const;
 
@@ -324,13 +348,17 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
     }
   }
 
-  async runConnectivityTest(): Promise<ConnectivityTestResult> {
+  async runConnectivityTest(
+    aiConfig: TModelConfig,
+  ): Promise<ConnectivityTestResult> {
     if (!this.serverUrl) {
       throw new Error('Server URL not configured');
     }
 
     const response = await fetch(`${this.serverUrl}/connectivity-test`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: aiConfig }),
     });
 
     if (!response.ok) {
@@ -430,6 +458,9 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
       }
 
       const result = await res.json();
+      if (result?.report) {
+        result.report = this.resolveReportUrl(result.report);
+      }
       return { success: true, ...result };
     } catch (error) {
       console.error('Failed to cancel task:', error);
@@ -621,7 +652,7 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
 
     try {
       const response = await fetch(
-        `${this.serverUrl}/recorder/events?since=${encodeURIComponent(String(since))}`,
+        `${this.serverUrl}/recorder/events?since=${encodeURIComponent(String(since))}&flushPending=false`,
       );
       if (!response.ok) {
         return { events: [], nextIndex: since };
@@ -640,6 +671,114 @@ export class RemoteExecutionAdapter extends BasePlaygroundAdapter {
     } catch (error) {
       console.error('Failed to poll recorder events:', error);
       return { events: [], nextIndex: since };
+    }
+  }
+
+  async describeRecorderEventAtPoint(
+    event: PlaygroundRecorderEvent,
+  ): Promise<PlaygroundRecorderDescribeResult> {
+    if (!this.serverUrl) {
+      return { ok: false, error: 'No server URL configured' };
+    }
+
+    try {
+      const response = await fetch(
+        `${this.serverUrl}/recorder/describe-event`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event }),
+        },
+      );
+      const data = (await response
+        .json()
+        .catch(() => null)) as PlaygroundRecorderDescribeResult | null;
+      if (!response.ok) {
+        return {
+          ok: false,
+          error:
+            data?.error ||
+            `Recorder describe request failed (${response.status})`,
+        };
+      }
+      return data || { ok: false, error: 'Empty recorder describe response' };
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to describe recorder event',
+      };
+    }
+  }
+
+  async getRecorderScreenshotAsset(assetId: string): Promise<string | null> {
+    if (!this.serverUrl || !assetId) {
+      return null;
+    }
+    try {
+      const response = await fetch(
+        `${this.serverUrl}/recorder/assets/${encodeURIComponent(assetId)}`,
+      );
+      if (!response.ok) {
+        return null;
+      }
+      const blob = await response.blob();
+      return await new Promise<string | null>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () =>
+          resolve(typeof reader.result === 'string' ? reader.result : null);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+    } catch (error) {
+      console.error('Failed to fetch recorder screenshot asset:', error);
+      return null;
+    }
+  }
+
+  getRecorderScreenshotAssetUrl(assetId: string): string | null {
+    if (!this.serverUrl || !/^[a-zA-Z0-9_-]+$/.test(assetId)) {
+      return null;
+    }
+    return `${this.serverUrl}/recorder/assets/${encodeURIComponent(assetId)}`;
+  }
+
+  async clearRecorderScreenshotAssets(sessionId: string): Promise<void> {
+    if (!this.serverUrl || !sessionId) {
+      return;
+    }
+    const response = await fetch(
+      `${this.serverUrl}/recorder/assets/session/${encodeURIComponent(sessionId)}`,
+      { method: 'DELETE' },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Recorder screenshot cleanup request failed (${response.status})`,
+      );
+    }
+  }
+
+  async pruneRecorderScreenshotAssets(
+    sessionId: string,
+    assetIds: string[],
+  ): Promise<void> {
+    if (!this.serverUrl || !sessionId) {
+      return;
+    }
+    const response = await fetch(
+      `${this.serverUrl}/recorder/assets/session/${encodeURIComponent(sessionId)}/prune`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ assetIds }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Recorder screenshot prune request failed (${response.status})`,
+      );
     }
   }
 

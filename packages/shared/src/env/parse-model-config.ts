@@ -279,6 +279,7 @@ export const parseOpenaiSdkConfig = ({
       const val = provider[keys.reasoningEnabled]?.trim()?.toLowerCase();
       if (val === 'true' || val === '1') return true;
       if (val === 'false' || val === '0') return false;
+      if (val === 'default') return 'default';
       return undefined;
     })(),
     reasoningBudget: (() => {
@@ -286,6 +287,14 @@ export const parseOpenaiSdkConfig = ({
       if (!val) return undefined;
       const num = Number(val);
       return Number.isFinite(num) ? num : undefined;
+    })(),
+    responseFormat: (() => {
+      const val = provider[keys.responseFormat]?.trim()?.toLowerCase();
+      if (!val || val === 'auto') return 'auto';
+      if (val === 'none') return 'none';
+      throw new Error(
+        `${keys.responseFormat} must be one of: none, auto. Got: ${val}`,
+      );
     })(),
   };
 };

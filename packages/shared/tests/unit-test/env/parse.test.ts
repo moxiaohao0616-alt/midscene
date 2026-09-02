@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 import { version } from '../../../package.json';
 import { DEFAULT_MODEL_CONFIG_KEYS } from '../../../src/env/constants';
 import {
@@ -38,6 +38,8 @@ describe('getUITarsModelVersion', () => {
     expect(getUITarsModelVersion('gemini')).toBeUndefined();
     expect(getUITarsModelVersion('glm-v')).toBeUndefined();
     expect(getUITarsModelVersion('gpt-5')).toBeUndefined();
+    expect(getUITarsModelVersion('kimi')).toBeUndefined();
+    expect(getUITarsModelVersion('xiaomi-mimo')).toBeUndefined();
   });
 });
 
@@ -50,6 +52,8 @@ describe('validateModelFamily', () => {
     expect(() => validateModelFamily('gemini')).not.toThrow();
     expect(() => validateModelFamily('glm-v')).not.toThrow();
     expect(() => validateModelFamily('gpt-5')).not.toThrow();
+    expect(() => validateModelFamily('kimi')).not.toThrow();
+    expect(() => validateModelFamily('xiaomi-mimo')).not.toThrow();
     expect(() => validateModelFamily('vlm-ui-tars')).not.toThrow();
     expect(() => validateModelFamily(undefined)).not.toThrow();
   });

@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  assertMacNativeCodeArchitectures,
   assertPortablePackagedNodeModules,
   buildArtifactBaseName,
   buildInstallWorkspaceManifest,
@@ -14,30 +15,57 @@ import {
   buildStudioDmgSpecification,
   buildVendoredWorkspaceDirName,
   buildVendoredWorkspaceManifest,
+  buildWindowsNsisArtifactName,
+  buildWindowsNsisConfig,
+  buildWindowsNsisInstallerArgs,
+  collectMacNativeArchitectureIssues,
   collectNestedMacCodeSignTargets,
   collectPackagedNodeModuleSymlinkIssues,
   collectWorkspaceDependencyClosure,
+  copyStudioFontLicenseToStageDir,
   dedupePlaygroundStatic,
   dropAntdEsmBuild,
   dropMidsceneEsmBuilds,
   getStudioElectronVersion,
+  loadAppDmg,
   normalizeReleaseVersion,
-  packagedAsarOptions,
   parseBooleanLike,
   pathContainsReportTemplatePlaceholder,
   pruneAntdUmdBundles,
   pruneGifwrapTestFixtures,
   pruneSourceMapFiles,
+  quoteWindowsShellArg,
+  readMacMachOArchitectures,
   releaseWorkspaceDir,
   resolveDefaultPackageArch,
   resolveMacCodeSignEntitlementsPath,
   resolveMacPackagedAppBundlePath,
   resolveMacPackagedAppSecurity,
+  resolveNodeModulesPackageEntry,
   resolvePackagedAppArchiver,
   resolvePackagerIconPath,
+  resolvePnpmPackageEntry,
   shouldUseShellForCommand,
   slimStageNodeModules,
 } from '../scripts/package-electron.mjs';
+import { packagedAsarOptions } from '../scripts/packaged-asar-resources.mjs';
+
+const createThinMacMachOBuffer = (arch) => {
+  const cpuTypes = {
+    x64: 0x01000007,
+    arm64: 0x0100000c,
+  };
+  const cpuType = cpuTypes[arch];
+  if (!cpuType) {
+    throw new Error(`Unsupported test Mach-O arch: ${arch}`);
+  }
+
+  const buffer = Buffer.alloc(32);
+  // 64-bit little-endian Mach-O magic.
+  buffer.writeUInt32BE(0xcffaedfe, 0);
+  buffer.writeUInt32LE(cpuType, 4);
+  return buffer;
+};
 
 describe('package-electron helpers', () => {
   it('normalizes Git tag versions for archive naming', () => {
@@ -67,6 +95,129 @@ describe('package-electron helpers', () => {
     expect(linkEntry?.y).toBe(160);
     expect(fileEntry?.path).toBe('/tmp/Midscene Studio Beta.app');
     expect(fileEntry?.name).toBe('Midscene Studio Beta.app');
+  });
+
+  it('loads appdmg from the pnpm store when the workspace symlink is missing', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'midscene-pnpm-'));
+    const appdmgDir = path.join(
+      root,
+      'node_modules',
+      '.pnpm',
+      'appdmg@0.6.6',
+      'node_modules',
+      'appdmg',
+    );
+    try {
+      await fs.mkdir(appdmgDir, { recursive: true });
+      await fs.writeFile(
+        path.join(appdmgDir, 'package.json'),
+        JSON.stringify({ main: 'index.mjs', type: 'module' }),
+      );
+      await fs.writeFile(
+        path.join(appdmgDir, 'index.mjs'),
+        'export default function appdmg() { return "loaded"; }\n',
+      );
+
+      expect(
+        resolvePnpmPackageEntry({
+          packageName: 'appdmg',
+          version: '0.6.6',
+          workspaceRoot: root,
+        }),
+      ).toBe(path.join(appdmgDir, 'index.mjs'));
+
+      const missingDirectImport = Object.assign(new Error('missing appdmg'), {
+        code: 'ERR_MODULE_NOT_FOUND',
+      });
+      const appdmg = await loadAppDmg({
+        directImport: async () => {
+          throw missingDirectImport;
+        },
+        workspaceRoot: root,
+      });
+      expect(appdmg()).toBe('loaded');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('loads appdmg from hoisted node_modules in the staged workspace', async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-hoisted-pnpm-'),
+    );
+    const appdmgDir = path.join(root, 'node_modules', 'appdmg');
+    try {
+      await fs.mkdir(appdmgDir, { recursive: true });
+      await fs.writeFile(
+        path.join(appdmgDir, 'package.json'),
+        JSON.stringify({ main: 'index.mjs', type: 'module' }),
+      );
+      await fs.writeFile(
+        path.join(appdmgDir, 'index.mjs'),
+        'export default function appdmg() { return "loaded from hoisted"; }\n',
+      );
+
+      expect(
+        resolveNodeModulesPackageEntry({
+          packageName: 'appdmg',
+          workspaceRoot: root,
+        }),
+      ).toBe(path.join(appdmgDir, 'index.mjs'));
+
+      const missingDirectImport = Object.assign(new Error('missing appdmg'), {
+        code: 'ERR_MODULE_NOT_FOUND',
+      });
+      const appdmg = await loadAppDmg({
+        directImport: async () => {
+          throw missingDirectImport;
+        },
+        workspaceRoot: root,
+      });
+      expect(appdmg()).toBe('loaded from hoisted');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('loads appdmg from the staged packaging workspace pnpm store', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'midscene-pnpm-'));
+    const stageRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-stage-pnpm-'),
+    );
+    const appdmgDir = path.join(
+      stageRoot,
+      'node_modules',
+      '.pnpm',
+      'appdmg@0.6.6',
+      'node_modules',
+      'appdmg',
+    );
+    try {
+      await fs.mkdir(appdmgDir, { recursive: true });
+      await fs.writeFile(
+        path.join(appdmgDir, 'package.json'),
+        JSON.stringify({ main: 'index.mjs', type: 'module' }),
+      );
+      await fs.writeFile(
+        path.join(appdmgDir, 'index.mjs'),
+        'export default function appdmg() { return "loaded from stage"; }\n',
+      );
+
+      const missingDirectImport = Object.assign(new Error('missing appdmg'), {
+        code: 'ERR_MODULE_NOT_FOUND',
+      });
+      const appdmg = await loadAppDmg({
+        directImport: async () => {
+          throw missingDirectImport;
+        },
+        workspaceRoot: root,
+        extraWorkspaceRoots: [stageRoot],
+      });
+      expect(appdmg()).toBe('loaded from stage');
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(stageRoot, { recursive: true, force: true });
+    }
   });
 
   it('builds a deterministic artifact basename', () => {
@@ -145,19 +296,28 @@ describe('package-electron helpers', () => {
     });
   });
 
-  it('keeps native modules and helper binaries outside app.asar', () => {
-    expect(packagedAsarOptions.unpack).toContain('*.{node,dll,dylib,so,exe}');
-    expect(packagedAsarOptions.unpackDir).toContain('node_modules/sharp');
-    expect(packagedAsarOptions.unpackDir).toContain('node_modules/@img');
-    expect(packagedAsarOptions.unpackDir).toContain(
-      path.join('node_modules', '@computer-use', 'libnut'),
+  it('copies the Inter OFL into the packaged app staging directory', async () => {
+    const stageDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-studio-license-'),
     );
-    expect(packagedAsarOptions.unpackDir).toContain(
-      path.join('node_modules', '@ffmpeg-installer'),
-    );
-    expect(packagedAsarOptions.unpackDir).toContain(
-      path.join('node_modules', '@midscene', 'computer', 'bin'),
-    );
+
+    try {
+      const destinationPath = await copyStudioFontLicenseToStageDir(stageDir);
+      const [sourceLicense, packagedLicense] = await Promise.all([
+        fs.readFile(
+          new URL('../src/renderer/assets/fonts/OFL.txt', import.meta.url),
+          'utf8',
+        ),
+        fs.readFile(destinationPath, 'utf8'),
+      ]);
+
+      expect(destinationPath).toBe(
+        path.join(stageDir, 'licenses', 'Inter-OFL.txt'),
+      );
+      expect(packagedLicense).toBe(sourceLicense);
+    } finally {
+      await fs.rm(stageDir, { force: true, recursive: true });
+    }
   });
 
   it('points packager at the Midscene .icns on macOS', () => {
@@ -196,6 +356,84 @@ describe('package-electron helpers', () => {
     expect(opts.icon).toMatch(/midscene-icon\.ico$/);
   });
 
+  it('builds a Windows NSIS installer name from the Studio archive basename', () => {
+    expect(
+      buildWindowsNsisArtifactName('midscene-studio-beta-v1.8.1-win32-x64'),
+    ).toBe('midscene-studio-beta-v1.8.1-win32-x64-setup.exe');
+  });
+
+  it('builds a Windows NSIS config for the Studio updater installer', () => {
+    expect(
+      buildWindowsNsisConfig({
+        artifactName: 'midscene-studio-beta-v1.8.1-win32-x64-setup.exe',
+        iconPath: '/tmp/midscene-icon.ico',
+      }),
+    ).toMatchObject({
+      appId: 'ai.midscene.studio.beta',
+      productName: 'Midscene Studio Beta',
+      directories: {
+        output: expect.stringContaining(
+          path.join('.release', 'studio', 'artifacts'),
+        ),
+      },
+      win: {
+        executableName: 'Midscene Studio Beta',
+        icon: '/tmp/midscene-icon.ico',
+        target: [
+          {
+            target: 'nsis',
+            arch: ['x64'],
+          },
+        ],
+      },
+      nsis: {
+        oneClick: true,
+        perMachine: false,
+        allowElevation: false,
+        artifactName: 'midscene-studio-beta-v1.8.1-win32-x64-setup.exe',
+        shortcutName: 'Midscene Studio Beta',
+        uninstallDisplayName: 'Midscene Studio Beta',
+        createDesktopShortcut: 'always',
+      },
+      npmRebuild: false,
+      publish: null,
+    });
+  });
+
+  it('targets the executable name emitted by the Windows packager', () => {
+    const packagerOptions = buildPackagerOptions({
+      arch: 'x64',
+      outDir: '/tmp/out',
+      platform: 'win32',
+      stageDir: '/tmp/stage',
+    });
+    const nsisConfig = buildWindowsNsisConfig({
+      artifactName: 'midscene-studio-beta-v1.8.1-win32-x64-setup.exe',
+      iconPath: '/tmp/midscene-icon.ico',
+    });
+
+    expect(nsisConfig.win.executableName).toBe(packagerOptions.name);
+  });
+
+  it('builds electron-builder CLI args for a prepackaged Windows NSIS installer', () => {
+    expect(
+      buildWindowsNsisInstallerArgs({
+        arch: 'x64',
+        configPath: '/tmp/nsis.config.json',
+        packagedAppPath: '/tmp/Midscene Studio Beta-win32-x64',
+      }),
+    ).toEqual([
+      'exec',
+      'electron-builder',
+      '--win',
+      'nsis',
+      '--x64',
+      '--prepackaged=/tmp/Midscene Studio Beta-win32-x64',
+      '--config=/tmp/nsis.config.json',
+      '--publish=never',
+    ]);
+  });
+
   it('resolves the resources directory when the app payload is packed as asar', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'midscene-app-'));
     try {
@@ -224,6 +462,31 @@ describe('package-electron helpers', () => {
   it('uses a shell for Windows .cmd package manager shims', () => {
     expect(shouldUseShellForCommand('pnpm.cmd', 'win32')).toBe(true);
     expect(shouldUseShellForCommand('pnpm', 'linux')).toBe(false);
+  });
+
+  it('quotes Windows shell args with spaces', () => {
+    expect(quoteWindowsShellArg('--x64')).toBe('--x64');
+    expect(quoteWindowsShellArg('')).toBe('""');
+    expect(
+      quoteWindowsShellArg(
+        '--prepackaged=D:\\a\\midscene\\Midscene Studio Beta-win32-x64',
+      ),
+    ).toBe('"--prepackaged=D:\\a\\midscene\\Midscene Studio Beta-win32-x64"');
+  });
+
+  it('escapes Windows shell metacharacters inside quoted args', () => {
+    // Parentheses are common in paths like "Program Files (x86)".
+    expect(quoteWindowsShellArg('C:\\Program Files (x86)\\Midscene')).toBe(
+      '"C:\\Program Files ^(x86^)\\Midscene"',
+    );
+    // Ampersand is the cmd command separator.
+    expect(quoteWindowsShellArg('a&b')).toBe('"a^&b"');
+    // Pipe redirects stdout.
+    expect(quoteWindowsShellArg('a|b')).toBe('"a^|b"');
+    // Caret itself must be escaped.
+    expect(quoteWindowsShellArg('a^b')).toBe('"a^^b"');
+    // Double quote inside the value.
+    expect(quoteWindowsShellArg('a"b')).toBe('"a^"b"');
   });
 
   it('parses boolean-like configuration values used by mac packaging flags', () => {
@@ -502,6 +765,105 @@ describe('package-electron helpers', () => {
     }
   });
 
+  it('reads the architecture from a thin Mach-O native module', async () => {
+    const tempRootDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-studio-mach-o-'),
+    );
+    const addonPath = path.join(tempRootDir, 'permissions.node');
+
+    try {
+      await fs.writeFile(addonPath, createThinMacMachOBuffer('arm64'));
+
+      await expect(readMacMachOArchitectures(addonPath)).resolves.toEqual([
+        'arm64',
+      ]);
+    } finally {
+      await fs.rm(tempRootDir, { force: true, recursive: true });
+    }
+  });
+
+  it('rejects arm64-only native modules in the packaged macOS x64 app', async () => {
+    const tempRootDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-studio-native-arch-'),
+    );
+    const appBundlePath = path.join(tempRootDir, 'Midscene Studio Beta.app');
+    const addonPath = path.join(
+      appBundlePath,
+      'Contents',
+      'Resources',
+      'app.asar.unpacked',
+      'node_modules',
+      'node-mac-permissions',
+      'build',
+      'Release',
+      'permissions.node',
+    );
+
+    try {
+      await fs.mkdir(path.dirname(addonPath), { recursive: true });
+      await fs.writeFile(addonPath, createThinMacMachOBuffer('arm64'));
+
+      await expect(
+        collectMacNativeArchitectureIssues({
+          appPath: appBundlePath,
+          arch: 'x64',
+        }),
+      ).resolves.toEqual([
+        {
+          path: addonPath,
+          expectedArch: 'x86_64',
+          actualArchs: ['arm64'],
+        },
+      ]);
+      await expect(
+        assertMacNativeCodeArchitectures({
+          appPath: appBundlePath,
+          arch: 'x64',
+        }),
+      ).rejects.toThrow(/expected x86_64, found arm64/);
+    } finally {
+      await fs.rm(tempRootDir, { force: true, recursive: true });
+    }
+  });
+
+  it('accepts x86_64 native modules in the packaged macOS x64 app', async () => {
+    const tempRootDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'midscene-studio-native-arch-'),
+    );
+    const appBundlePath = path.join(tempRootDir, 'Midscene Studio Beta.app');
+    const addonPath = path.join(
+      appBundlePath,
+      'Contents',
+      'Resources',
+      'app.asar.unpacked',
+      'node_modules',
+      'node-mac-permissions',
+      'build',
+      'Release',
+      'permissions.node',
+    );
+
+    try {
+      await fs.mkdir(path.dirname(addonPath), { recursive: true });
+      await fs.writeFile(addonPath, createThinMacMachOBuffer('x64'));
+
+      await expect(
+        collectMacNativeArchitectureIssues({
+          appPath: appBundlePath,
+          arch: 'x64',
+        }),
+      ).resolves.toEqual([]);
+      await expect(
+        assertMacNativeCodeArchitectures({
+          appPath: appBundlePath,
+          arch: 'x64',
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      await fs.rm(tempRootDir, { force: true, recursive: true });
+    }
+  });
+
   it('selects Electron helper entitlements that match the osx-sign defaults', () => {
     expect(
       resolveMacCodeSignEntitlementsPath(
@@ -663,6 +1025,9 @@ describe('package-electron helpers', () => {
           '@midscene/shared': 'workspace:*',
           react: '18.3.1',
         },
+        optionalDependencies: {
+          appdmg: '0.6.6',
+        },
         description: 'Studio shell',
         license: 'MIT',
         type: 'module',
@@ -687,6 +1052,9 @@ describe('package-electron helpers', () => {
         '@midscene/playground': '1.7.4',
         '@midscene/shared': '1.7.4',
         react: '18.3.1',
+      },
+      optionalDependencies: {
+        appdmg: '0.6.6',
       },
       main: 'dist/main/main.cjs',
       pnpm: {
@@ -1065,15 +1433,16 @@ describe('package-electron helpers', () => {
   });
 
   it('detects unresolved report template placeholders in runtime output only', async () => {
+    const reportTemplatePlaceholderFixture = 'REPLACE_ME_WITH_REPORT_HTML';
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'midscene-report-'));
     try {
       await fs.writeFile(
         path.join(root, 'guard.js'),
-        "if (html.includes('REPLACE_ME_WITH_REPORT_HTML')) reportHTML = null;",
+        `if (html.includes('${reportTemplatePlaceholderFixture}')) reportHTML = null;`,
       );
       await fs.writeFile(
         path.join(root, 'bundle.js.map'),
-        '{"sourcesContent":["const reportTpl = \'REPLACE_ME_WITH_REPORT_HTML\';"]}',
+        `{"sourcesContent":["const reportTpl = '${reportTemplatePlaceholderFixture}';"]}`,
       );
 
       await expect(pathContainsReportTemplatePlaceholder(root)).resolves.toBe(
@@ -1082,7 +1451,7 @@ describe('package-electron helpers', () => {
 
       await fs.writeFile(
         path.join(root, 'utils.js'),
-        "const reportTpl = 'REPLACE_ME_WITH_REPORT_HTML';",
+        `const reportTpl = '${reportTemplatePlaceholderFixture}';`,
       );
 
       await expect(pathContainsReportTemplatePlaceholder(root)).resolves.toBe(
@@ -1187,5 +1556,53 @@ describe('package-electron helpers', () => {
     expect(workflow).not.toMatch(/--skip-archive/);
     expect(workflow).toMatch(/Package Midscene Studio Beta/);
     expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.zip/);
+    expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.exe/);
+    expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.blockmap/);
+  });
+
+  it('package validation workflow uploads Windows installer artifacts', async () => {
+    const workflowPath = path.join(
+      releaseWorkspaceDir,
+      '..',
+      '..',
+      '.github',
+      'workflows',
+      'studio-package-validation.yml',
+    );
+    const workflow = await fs.readFile(workflowPath, 'utf8');
+    expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.zip/);
+    expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.exe/);
+    expect(workflow).toMatch(/\.release\/studio\/artifacts\/\*\.blockmap/);
+  });
+
+  it('packages macOS x64 Studio on an Intel GitHub runner', async () => {
+    const workflowPaths = [
+      path.join(
+        releaseWorkspaceDir,
+        '..',
+        '..',
+        '.github',
+        'workflows',
+        'release.yml',
+      ),
+      path.join(
+        releaseWorkspaceDir,
+        '..',
+        '..',
+        '.github',
+        'workflows',
+        'studio-package-validation.yml',
+      ),
+    ];
+
+    for (const workflowPath of workflowPaths) {
+      const workflow = await fs.readFile(workflowPath, 'utf8');
+      expect(workflow).toMatch(
+        /os:\s*macos-15-intel\s*\n\s*platform:\s*darwin\s*\n\s*arch:\s*x64/,
+      );
+      expect(workflow).toMatch(
+        /Build @midscene\/computer native helpers[\s\S]*pnpm --filter @midscene\/computer run build:native/,
+      );
+    }
   });
 });

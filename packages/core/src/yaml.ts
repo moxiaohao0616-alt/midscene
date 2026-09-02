@@ -9,6 +9,8 @@ import type { UIContext } from './types';
 
 export interface LocateOption extends Partial<TMultimodalPrompt> {
   prompt?: TUserPrompt;
+  /** Additional context for this AI request. */
+  context?: string;
   deepLocate?: boolean; // only available in vl model
   /** @deprecated Use `deepLocate` instead. Kept for backward compatibility. */
   deepThink?: boolean; // alias for deepLocate
@@ -19,14 +21,23 @@ export interface LocateOption extends Partial<TMultimodalPrompt> {
 }
 
 export interface ServiceExtractOption {
+  /** Additional context for this AI request. */
+  context?: string;
   domIncluded?: boolean | 'visible-only';
   screenshotIncluded?: boolean;
   [key: string]: unknown;
 }
 
 export interface DetailedLocateParam
-  extends Omit<LocateOption, 'deepThink' | keyof TMultimodalPrompt> {
+  extends Omit<
+    LocateOption,
+    'context' | 'deepThink' | keyof TMultimodalPrompt
+  > {
   prompt: TUserPrompt;
+  /** Original prompt text used for user-facing reports. */
+  promptDisplay?: string;
+  /** Per-call business context used for user-facing reports. */
+  context?: string;
 }
 
 export type ScrollType =
@@ -55,6 +66,8 @@ export interface MidsceneYamlScript {
   // @deprecated
   target?: MidsceneYamlScriptWebEnv;
 
+  page?: MidsceneYamlScriptWebEnv;
+  browser?: MidsceneYamlScriptWebEnv;
   web?: MidsceneYamlScriptWebEnv;
   android?: MidsceneYamlScriptAndroidEnv;
   ios?: MidsceneYamlScriptIOSEnv;
@@ -128,6 +141,8 @@ export interface MidsceneYamlScriptEnvGeneralInterface {
 export interface MidsceneYamlScriptWebEnv
   extends MidsceneYamlScriptConfig,
     MidsceneYamlScriptAgentOpt {
+  mode?: 'page' | 'browser';
+
   // for web only
   serve?: string;
   url: string;
@@ -162,7 +177,22 @@ export interface MidsceneYamlScriptWebEnv
    */
   extraHTTPHeaders?: Record<string, string>;
 
-  forceSameTabNavigation?: boolean; // if track the newly opened tab, true for default in yaml script
+  forceSameTabNavigation?: boolean; // if limit the new tab to the current page, true for default in yaml script
+  autoFollowNewPage?: boolean; // if use BrowserAgent to follow newly opened pages, false for default
+
+  /**
+   * Chrome download directory (Puppeteer only, not supported in bridge mode).
+   *
+   * Relative paths are resolved from the current working directory.
+   *
+   * @example
+   * ```yaml
+   * web:
+   *   url: https://example.com
+   *   downloadPath: ./downloads
+   * ```
+   */
+  downloadPath?: string;
 
   /**
    * Custom Chrome launch arguments (Puppeteer only, not supported in bridge mode).
@@ -226,10 +256,12 @@ export interface MidsceneYamlScriptHarmonyEnv
   // The HarmonyOS device ID to connect to, optional, will use the first device if not specified
   deviceId?: string;
 
-  // The app package to launch, optional, will use the current screen if not specified
+  // The bundle name, bundle/Ability target, or mapped app name to launch, optional,
+  // will use the current screen if not specified
   launch?: string;
 
-  // Custom mapping of app names to bundle names, user-provided mappings take precedence over defaults
+  // Custom mapping of app names to bundle names or explicit bundle/Ability targets;
+  // user-provided mappings take precedence over defaults
   appNameMapping?: Record<string, string>;
 }
 
@@ -268,6 +300,10 @@ export interface MidsceneYamlFlowItemAIWaitFor extends ServiceExtractOption {
   timeout?: number;
 }
 
+export interface MidsceneYamlFlowItemRunGherkinScenario {
+  runGherkinScenario: string;
+}
+
 export interface MidsceneYamlFlowItemEvaluateJavaScript {
   javascript: string;
   name?: string;
@@ -287,13 +323,14 @@ export type MidsceneYamlFlowItem =
   | MidsceneYamlFlowItemAIAction
   | MidsceneYamlFlowItemAIAssert
   | MidsceneYamlFlowItemAIWaitFor
+  | MidsceneYamlFlowItemRunGherkinScenario
   | MidsceneYamlFlowItemEvaluateJavaScript
   | MidsceneYamlFlowItemSleep
   | MidsceneYamlFlowItemLogScreenshot;
 
 export interface FreeFn {
   name: string;
-  fn: () => void;
+  fn: () => void | Promise<void>;
 }
 
 export interface ScriptPlayerTaskStatus extends MidsceneYamlTask {
@@ -317,10 +354,25 @@ export interface MidsceneYamlConfig {
    */
   retry?: number;
   summary?: string;
+  /**
+   * Share one BrowserContext and Page across Puppeteer Web yaml files. This is
+   * not supported by bridge mode or non-Web targets.
+   */
   shareBrowserContext?: boolean;
+  /** @deprecated Use `web`, `page`, or `browser` instead. */
+  target?: MidsceneYamlScriptWebEnv;
+  page?: MidsceneYamlScriptWebEnv;
+  browser?: MidsceneYamlScriptWebEnv;
   web?: MidsceneYamlScriptWebEnv;
   android?: MidsceneYamlScriptAndroidEnv;
   ios?: MidsceneYamlScriptIOSEnv;
+  /**
+   * A setup yaml file that runs before the main `files`. A setup failure aborts
+   * the whole batch and the main files are marked as not executed. Puppeteer
+   * Web setup requires `shareBrowserContext: true` to pass browser state to the
+   * main files. Other targets run setup without browser-context sharing.
+   */
+  setup?: string;
   files: string[];
   headed?: boolean;
   keepWindow?: boolean;

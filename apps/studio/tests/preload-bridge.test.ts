@@ -28,6 +28,7 @@ describe('preload bridge', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.invoke.mockResolvedValue(undefined);
+    vi.unstubAllEnvs();
   });
 
   it('exposes shell, studio runtime, and updater APIs that proxy over IPC', async () => {
@@ -52,6 +53,7 @@ describe('preload bridge', () => {
     await shellApi.closeWindow();
     await shellApi.minimizeWindow();
     await shellApi.openExternalUrl('https://midscenejs.com');
+    await shellApi.openRunDirectory();
     await shellApi.chooseReportSavePath('report.html');
     await shellApi.chooseFileSavePath({
       defaultFileName: 'recording.json',
@@ -75,9 +77,14 @@ describe('preload bridge', () => {
     );
     await studioRuntimeApi.setDiscoveryPollingPaused(true);
     await studioRuntimeApi.runConnectivityTest({
-      apiKey: 'sk-test',
-      baseUrl: 'https://api.example.com/v1',
-      model: 'gpt-4o',
+      MIDSCENE_MODEL_API_KEY: 'sk-test',
+      MIDSCENE_MODEL_BASE_URL: 'https://api.example.com/v1',
+      MIDSCENE_MODEL_NAME: 'gpt-4o',
+    });
+    await studioRuntimeApi.updateAgentOptions({
+      replanningCycleLimit: 12,
+      waitAfterAction: 500,
+      screenshotShrinkFactor: 2,
     });
     await studioRuntimeApi.generateRecorderCode({
       type: 'playwright',
@@ -144,6 +151,7 @@ describe('preload bridge', () => {
       [IPC_CHANNELS.closeWindow],
       [IPC_CHANNELS.minimizeWindow],
       [IPC_CHANNELS.openExternalUrl, 'https://midscenejs.com'],
+      [IPC_CHANNELS.openRunDirectory],
       [IPC_CHANNELS.chooseReportSavePath, 'report.html'],
       [
         IPC_CHANNELS.chooseFileSavePath,
@@ -174,9 +182,17 @@ describe('preload bridge', () => {
       [
         IPC_CHANNELS.runConnectivityTest,
         {
-          apiKey: 'sk-test',
-          baseUrl: 'https://api.example.com/v1',
-          model: 'gpt-4o',
+          MIDSCENE_MODEL_API_KEY: 'sk-test',
+          MIDSCENE_MODEL_BASE_URL: 'https://api.example.com/v1',
+          MIDSCENE_MODEL_NAME: 'gpt-4o',
+        },
+      ],
+      [
+        IPC_CHANNELS.updateAgentOptions,
+        {
+          replanningCycleLimit: 12,
+          waitAfterAction: 500,
+          screenshotShrinkFactor: 2,
         },
       ],
       [

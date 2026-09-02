@@ -1,108 +1,23 @@
 import type {
-  BaseElement,
   DeviceAction,
-  ElementTreeNode,
   MidsceneYamlFlowItem,
   PlanningAction,
-  Rect,
-  Size,
 } from '@/types';
-import { NodeType } from '@midscene/shared/constants';
-import { treeToList } from '@midscene/shared/extractor';
-import {
-  compositeElementInfoImg,
-  preProcessImageUrl,
-} from '@midscene/shared/img';
-import { assert, isPlainObject } from '@midscene/shared/utils';
-import type { ChatCompletionUserMessageParam } from 'openai/resources/index';
+import { isPlainObject } from '@midscene/shared/utils';
 import { z } from 'zod';
 
-/**
- * Expand the search area to at least 400 x 400 pixels
- *
- * Step 1: Extend 100px on each side (top, right, bottom, left)
- * - If the element is near a boundary, expansion on that side will be limited
- * - No compensation is made for boundary limitations (this is intentional)
- *
- * Step 2: Ensure the area is at least 400x400 pixels
- * - Scale up proportionally from the center if needed
- * - Final result is clamped to screen boundaries
- */
-export function expandSearchArea(rect: Rect, screenSize: Size): Rect {
-  const minArea = 400 * 400;
-  const expandSize = 100;
-
-  // Step 1: Extend each side by expandSize (100px), clamped to screen boundaries
-  // Note: If element is near boundary, actual expansion may be less than 100px on that side
-  const expandedLeft = Math.max(rect.left - expandSize, 0);
-  const expandedTop = Math.max(rect.top - expandSize, 0);
-
-  const expandRect = {
-    left: expandedLeft,
-    top: expandedTop,
-    width: Math.min(
-      rect.left - expandedLeft + rect.width + expandSize,
-      screenSize.width - expandedLeft,
-    ),
-    height: Math.min(
-      rect.top - expandedTop + rect.height + expandSize,
-      screenSize.height - expandedTop,
-    ),
-  };
-
-  // Step 2: Check if area is already >= 400x400
-  const currentArea = expandRect.width * expandRect.height;
-
-  if (currentArea >= minArea) {
-    return expandRect;
+export function findActionInActionSpaceOrThrow(
+  planType: string,
+  actionSpace: DeviceAction<any>[],
+): DeviceAction<any> {
+  const action = actionSpace.find((item) => item.name === planType);
+  if (!action) {
+    const available = actionSpace.map((item) => item.name).join(', ');
+    throw new Error(
+      `Action type '${planType}' is not in the current action space. Available actions: ${available || '(none)'}`,
+    );
   }
-
-  // Step 2: Scale up from center to reach minimum 400x400 area
-  const centerX = expandRect.left + expandRect.width / 2;
-  const centerY = expandRect.top + expandRect.height / 2;
-
-  // Calculate scale factor needed to reach minimum area
-  const scaleFactor = Math.sqrt(minArea / currentArea);
-  const newWidth = Math.round(expandRect.width * scaleFactor);
-  const newHeight = Math.round(expandRect.height * scaleFactor);
-
-  // Calculate new position based on center point
-  const newLeft = Math.round(centerX - newWidth / 2);
-  const newTop = Math.round(centerY - newHeight / 2);
-
-  // Clamp to screen boundaries
-  const left = Math.max(newLeft, 0);
-  const top = Math.max(newTop, 0);
-
-  return {
-    left,
-    top,
-    width: Math.min(newWidth, screenSize.width - left),
-    height: Math.min(newHeight, screenSize.height - top),
-  };
-}
-
-export async function markupImageForLLM(
-  screenshotBase64: string,
-  tree: ElementTreeNode<BaseElement>,
-  size: Size,
-) {
-  const elementsInfo = treeToList(tree);
-  const elementsPositionInfoWithoutText = elementsInfo!.filter(
-    (elementInfo) => {
-      if (elementInfo.attributes.nodeType === NodeType.TEXT) {
-        return false;
-      }
-      return true;
-    },
-  );
-
-  const imagePayload = await compositeElementInfoImg({
-    inputImgBase64: screenshotBase64,
-    elementsPositionInfo: elementsPositionInfoWithoutText,
-    size,
-  });
-  return imagePayload;
+  return action;
 }
 
 export function buildYamlFlowFromPlans(
@@ -114,13 +29,7 @@ export function buildYamlFlowFromPlans(
   for (const plan of plans) {
     const verb = plan.type;
 
-    const action = actionSpace.find((action) => action.name === verb);
-    if (!action) {
-      console.warn(
-        `Cannot convert action ${verb} to yaml flow. Will ignore it.`,
-      );
-      continue;
-    }
+    const action = findActionInActionSpaceOrThrow(verb, actionSpace);
 
     const flowKey = action.interfaceAlias || verb;
     const flowParam = action.paramSchema
@@ -220,56 +129,6 @@ export const userPromptToMultimodalPrompt = (
   };
 };
 
-export const multimodalPromptToChatMessages = async (
-  multimodalPrompt?: TMultimodalPrompt,
-): Promise<ChatCompletionUserMessageParam[]> => {
-  const msgs: ChatCompletionUserMessageParam[] = [];
-  if (multimodalPrompt?.images?.length) {
-    msgs.push({
-      role: 'user',
-      content: [
-        {
-          type: 'text',
-          text: 'Next, I will provide all the reference images. These reference images are supporting context only, not the current screenshot being evaluated, unless the task explicitly asks for comparison or matching.',
-        },
-      ],
-    });
-
-    for (const item of multimodalPrompt.images) {
-      const imagePayload = await preProcessImageUrl(
-        item.url,
-        !!multimodalPrompt.convertHttpImage2Base64,
-      );
-
-      msgs.push({
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `this is the reference image named '${item.name}'. It is a reference image, not the current screenshot:`,
-          },
-        ],
-      });
-
-      msgs.push({
-        role: 'user',
-        content: [
-          {
-            type: 'image_url',
-            image_url: {
-              url: imagePayload,
-              detail: 'high',
-            },
-          },
-        ],
-      });
-    }
-  }
-  return msgs;
-};
-
-const locateFieldFlagName = 'midscene_location_field_flag';
-
 // Schema for locator field input (when users provide locate parameters)
 const MidsceneLocationInput = z
   .object({
@@ -303,12 +162,6 @@ export const ifMidsceneLocatorField = (field: any): boolean => {
   if (actualField._def?.typeName === 'ZodObject') {
     const shape = actualField._def.shape();
 
-    // Method 1: Check for the location field flag (for result schema)
-    if (locateFieldFlagName in shape) {
-      return true;
-    }
-
-    // Method 2: Check if it's the input schema by checking for 'prompt' field
     // Input schema has 'prompt' as a required field
     if ('prompt' in shape && shape.prompt) {
       return true;
@@ -329,33 +182,6 @@ const formatPromptWithImages = (
   return promptString;
 };
 
-export const dumpMidsceneLocatorField = (field: any): string => {
-  assert(
-    ifMidsceneLocatorField(field),
-    'field is not a midscene locator field',
-  );
-
-  // If field is a string, return it directly
-  if (typeof field === 'string') {
-    return field;
-  }
-
-  // If field is an object with prompt property
-  if (field && typeof field === 'object' && field.prompt) {
-    // If prompt is a string, return it directly
-    if (typeof field.prompt === 'string') {
-      return field.prompt;
-    }
-    // If prompt is a TUserPrompt object, extract the prompt string
-    if (typeof field.prompt === 'object' && field.prompt.prompt) {
-      return formatPromptWithImages(field.prompt);
-    }
-  }
-
-  // Fallback: try to convert to string
-  return String(field);
-};
-
 export const findAllMidsceneLocatorField = (
   zodType?: z.ZodType<any>,
   requiredOnly?: boolean,
@@ -370,6 +196,8 @@ export const findAllMidsceneLocatorField = (
     const keys = Object.keys(zodObject.shape);
     return keys.filter((key) => {
       const field = zodObject.shape[key];
+      // TODO: A similar locator-field check exists as isMidsceneLocatorField in
+      // @midscene/shared/zod-schema-utils.
       if (!ifMidsceneLocatorField(field)) {
         return false;
       }

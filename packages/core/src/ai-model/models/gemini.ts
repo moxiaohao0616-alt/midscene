@@ -1,13 +1,12 @@
 import type { TModelFamily } from '@midscene/shared/env';
 import type OpenAI from 'openai';
-import { defaultExtractContentAndReasoning } from './chat-content';
 import type {
   ChatCompletionCallContext,
   ChatCompletionContentSource,
   ChatCompletionParamsResult,
   ContentAndReasoning,
   ModelAdapterDefinition,
-} from './types';
+} from '../model-adapter/types';
 
 type GeminiContentPart = Record<string, unknown> & {
   text?: string;
@@ -30,8 +29,8 @@ type GeminiContentSource =
 const buildGeminiChatCompletionParams = (
   input: ChatCompletionCallContext,
 ): ChatCompletionParamsResult => {
-  const { midsceneDefaults, userConfig, intent } = input;
-  const { reasoningEffort } = userConfig;
+  const { midsceneDefaults, userConfig } = input;
+  const { reasoningEnabled, reasoningEffort } = userConfig;
   const commonOverrideConfig: Record<string, unknown> = {};
 
   if (userConfig.temperature !== undefined) {
@@ -41,37 +40,30 @@ const buildGeminiChatCompletionParams = (
   const modelSpecificConfig: {
     extra_body?: {
       google?: {
-        thinking_config: Record<string, unknown>;
+        thinking_config: {
+          include_thoughts: true;
+          thinking_level: string;
+        };
       };
     };
-    reasoning_effort?: unknown;
   } = {};
 
-  if (intent === 'insight') {
+  if (reasoningEnabled !== 'default') {
+    // Gemini cannot fully disable native thinking, so "disabled" maps to the
+    // lowest thinking level. `include_thoughts` only controls whether Gemini
+    // returns thought summaries; it does not enable thinking, and thought token
+    // usage is based on the full thoughts Gemini generates regardless of
+    // whether summaries are included.
     modelSpecificConfig.extra_body = {
       google: {
         thinking_config: {
-          // In real Gemini tests, insight calls need `include_thoughts` to get
-          // the model's thinking, and Gemini puts that thinking into `content`.
           include_thoughts: true,
+          thinking_level: reasoningEnabled
+            ? (reasoningEffort ?? 'medium')
+            : 'minimal',
         },
       },
     };
-  }
-
-  if (reasoningEffort) {
-    modelSpecificConfig.extra_body = {
-      google: {
-        thinking_config: {
-          thinking_level: reasoningEffort,
-          include_thoughts: true,
-        },
-      },
-    };
-  } else {
-    // Gemini 3.x cannot fully disable native thinking, so use the lowest
-    // supported effort unless the user explicitly requests another level.
-    modelSpecificConfig.reasoning_effort = 'minimal';
   }
 
   return {
@@ -172,21 +164,22 @@ export const extractGeminiContentAndReasoning = (
     };
   }
 
-  const result = defaultExtractContentAndReasoning(
-    message as ChatCompletionContentSource,
-  );
+  const content = typeof message.content === 'string' ? message.content : '';
   // In real Gemini OpenAI-compatible responses we observed that
   // `include_thoughts` can still return a plain string `message.content`,
   // with the thought summary prepended as `<thought>...</thought>` before the
   // visible answer. Keep content unchanged, but extract that leading thought
   // text for report display.
-  const geminiReasoningContent = extractInlineThought(result.content) || '';
+  const geminiReasoningContent = extractInlineThought(content) || '';
 
   return {
-    content: result.content,
+    content,
     reasoning_content: formatReasoningContent({
       geminiReasoningContent,
-      providerReasoningContent: result.reasoning_content,
+      providerReasoningContent:
+        typeof message.reasoning_content === 'string'
+          ? message.reasoning_content
+          : '',
     }),
   };
 };
@@ -194,13 +187,18 @@ export const extractGeminiContentAndReasoning = (
 export const geminiAdapters = {
   gemini: {
     chatCompletion: {
-      unsupportedUserConfig: ['reasoningEnabled', 'reasoningBudget'],
+      unsupportedUserConfig: ['reasoningBudget'],
       buildChatCompletionParams: buildGeminiChatCompletionParams,
-      extractContentAndReasoning: extractGeminiContentAndReasoning,
+      messageExtraction: {
+        kind: 'custom',
+        extractContentAndReasoning: extractGeminiContentAndReasoning,
+      },
     },
     locate: {
-      resultAdapter: {
-        coordinates: { shape: 'bbox', order: 'yx', normalizedBy: 1000 },
+      element: {
+        resultFormat: {
+          coordinates: { shape: 'bbox', order: 'yx', normalizedBy: 1000 },
+        },
       },
     },
   },

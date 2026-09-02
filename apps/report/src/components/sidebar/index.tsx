@@ -1,35 +1,45 @@
 import './index.less';
 import { useAllCurrentTasks, useExecutionDump } from '@/components/store';
-import type { AIUsageInfo, ExecutionTask } from '@midscene/core';
+import {
+  CopyOutlined,
+  DownloadOutlined,
+  FileMarkdownOutlined,
+} from '@ant-design/icons';
+import { type ExecutionTask, deriveTaskStatus } from '@midscene/core';
 import { typeStr } from '@midscene/core/agent';
+import { collectReportSummary } from '@midscene/core/report-stats';
 import {
   type AnimationScript,
+  fullTimeStrWithMilliseconds,
   iconForStatus,
   timeCostStrElement,
 } from '@midscene/visualizer';
-import { Checkbox, Tag, Tooltip } from 'antd';
+import { Alert, Button, Checkbox, Tag, Tooltip } from 'antd';
 import { useEffect, useMemo } from 'react';
+import type { Ref } from 'react';
 import CameraIcon from '../../icons/camera.svg?react';
 import MessageIcon from '../../icons/message.svg?react';
 import PlayIcon from '../../icons/play.svg?react';
-import type { PlaywrightTasks } from '../../types';
+import type { PlaywrightTasks, ReportViewMode } from '../../types';
+import {
+  type MarkdownView,
+  markdownZipDownloadTooltip,
+} from '../../utils/markdown-export';
 import {
   hasDeepLocateFlag,
   hasDeepThinkFlag,
+  hasObserverAssertionFlag,
 } from '../../utils/report-task-tags';
+import { anchorIdForTask } from '../../utils/task-anchor';
 import ReportOverview from '../report-overview';
-
-// Extended task type with searchAreaUsage
-type ExecutionTaskWithSearchAreaUsage = ExecutionTask & {
-  searchAreaUsage?: AIUsageInfo;
-};
+import MarkdownSource from './markdown-source';
 
 // Table row data type
 type TableRowData = {
   key: string;
   isGroupHeader?: boolean;
   groupName?: string;
-  task?: ExecutionTaskWithSearchAreaUsage;
+  task?: ExecutionTask;
 };
 
 interface SidebarProps {
@@ -39,6 +49,15 @@ interface SidebarProps {
   replayAllScripts?: AnimationScript[] | null;
   replayAllMode?: boolean;
   setReplayAllMode?: (mode: boolean) => void;
+  reportViewMode?: ReportViewMode;
+  onReportViewModeChange?: (mode: ReportViewMode) => void;
+  reportMarkdownView?: MarkdownView | null;
+  onMarkdownImageClick?: (markdownPath: string) => void;
+  markdownScrollContainerRef?: Ref<HTMLDivElement>;
+  reportMarkdownActionsDisabled?: boolean;
+  onCopyReportMarkdown?: () => void;
+  onDownloadReportMarkdownZip?: () => void;
+  onReportCaseChange?: () => void;
 }
 
 const Sidebar = (props: SidebarProps = {}): JSX.Element => {
@@ -47,8 +66,20 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     proModeEnabled = false,
     onProModeChange,
     setReplayAllMode,
+    reportViewMode = 'human',
+    onReportViewModeChange,
+    reportMarkdownView,
+    onMarkdownImageClick,
+    markdownScrollContainerRef,
+    reportMarkdownActionsDisabled = true,
+    onCopyReportMarkdown,
+    onDownloadReportMarkdownZip,
+    onReportCaseChange,
   } = props;
   const groupedDump = useExecutionDump((store) => store.dump);
+  const playwrightAttributes = useExecutionDump(
+    (store) => store.playwrightAttributes,
+  );
   const setActiveTask = useExecutionDump((store) => store.setActiveTask);
   const activeTask = useExecutionDump((store) => store.activeTask);
   const setHoverTask = useExecutionDump((store) => store.setHoverTask);
@@ -62,7 +93,6 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
   const currentSelectedIndex = allTasks?.findIndex(
     (task) => task === activeTask,
   );
-
   // Prepare table data source
   const tableData = useMemo<TableRowData[]>(() => {
     if (!groupedDump) return [];
@@ -80,7 +110,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
       execution.tasks.forEach((task, taskIndex) => {
         rows.push({
           key: `task-${executionIndex}-${taskIndex}`,
-          task: task as ExecutionTaskWithSearchAreaUsage,
+          task,
         });
       });
     });
@@ -111,41 +141,23 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     return groupedDump.executions.some((execution) =>
       execution.tasks.some((task) => {
         const mainCached = task.usage?.cached_input || 0;
-        const searchAreaCached =
-          (task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-            ?.cached_input || 0;
+        const searchAreaCached = task.searchAreaUsage?.cached_input || 0;
         return mainCached + searchAreaCached > 0;
       }),
     );
   }, [groupedDump]);
 
   // Helper functions for rendering
-  const getStatusIcon = (task: ExecutionTaskWithSearchAreaUsage) => {
-    const isFinished = task.status === 'finished';
-    const isError = isFinished && (task.error || task.errorMessage);
-
-    if (isError) {
-      return iconForStatus('failed');
-    }
-
-    const isAssertFinishedWithWarning =
-      isFinished && task.subType === 'WaitFor' && task.output === false;
-
-    if (isAssertFinishedWithWarning) {
-      return iconForStatus('finishedWithWarning');
-    }
-
-    const isAssertFailed =
-      task.subType === 'Assert' && isFinished && task.output === false;
-
-    if (isAssertFailed) {
-      return iconForStatus('failed');
-    }
-
-    return iconForStatus(task.status);
+  const getStatusIcon = (task: ExecutionTask) => {
+    // Share the same failure semantics as the merged-report status derivation
+    // (deriveTaskStatus) so step icons and merged Passed/Failed never diverge.
+    const status = deriveTaskStatus(task);
+    // `warning` maps to the dedicated warning icon; every other value is a
+    // status string iconForStatus already understands.
+    return iconForStatus(status === 'warning' ? 'finishedWithWarning' : status);
   };
 
-  const getTitleIcon = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getTitleIcon = (task: ExecutionTask) => {
     return task.type === 'Planning' && task.subType !== 'LoadYaml' ? (
       <span
         style={{
@@ -159,7 +171,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ) : null;
   };
 
-  const getCacheTag = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getCacheTag = (task: ExecutionTask) => {
     return task.hitBy?.from === 'Cache' ? (
       <Tag
         className="cache-tag"
@@ -176,7 +188,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ) : null;
   };
 
-  const getDomIncludedTag = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getDomIncludedTag = (task: ExecutionTask) => {
     const isDomIncludedInsightTask =
       task.type === 'Insight' &&
       (
@@ -201,7 +213,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ) : null;
   };
 
-  const getDeepLocateTag = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getDeepLocateTag = (task: ExecutionTask) => {
     return hasDeepLocateFlag(task) ? (
       <Tag
         className="deeplocate-tag"
@@ -218,7 +230,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ) : null;
   };
 
-  const getDeepThinkTag = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getDeepThinkTag = (task: ExecutionTask) => {
     return hasDeepThinkFlag(task) ? (
       <Tag
         className="deepthink-tag"
@@ -235,17 +247,52 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ) : null;
   };
 
-  const getStatusText = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getObservedTag = (task: ExecutionTask) => {
+    return hasObserverAssertionFlag(task) ? (
+      <Tag
+        className="observed-tag"
+        bordered={false}
+        style={{
+          padding: '0 4px',
+          marginLeft: '4px',
+          marginRight: 0,
+          lineHeight: '16px',
+        }}
+      >
+        Observed
+      </Tag>
+    ) : null;
+  };
+
+  const getXPathTag = (task: ExecutionTask) => {
+    if (task.hitBy?.from !== 'User expected path') {
+      return null;
+    }
+
+    return (
+      <Tag
+        className="xpath-tag"
+        style={{
+          padding: '0 4px',
+          marginLeft: '4px',
+          marginRight: 0,
+          lineHeight: '16px',
+        }}
+        bordered={false}
+      >
+        XPath
+      </Tag>
+    );
+  };
+
+  const getStatusText = (task: ExecutionTask) => {
     if (typeof task.timing?.cost === 'number') {
       return timeCostStrElement(task.timing.cost);
     }
     return task.status;
   };
 
-  const getTokens = (
-    task: ExecutionTaskWithSearchAreaUsage,
-    type: 'prompt' | 'completion',
-  ) => {
+  const getTokens = (task: ExecutionTask, type: 'prompt' | 'completion') => {
     const key = type === 'prompt' ? 'prompt_tokens' : 'completion_tokens';
     const mainUsage = task.usage?.[key] || 0;
     const searchAreaUsage = task.searchAreaUsage?.[key] || 0;
@@ -253,7 +300,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     return total > 0 ? total : '-';
   };
 
-  const getCachedTokens = (task: ExecutionTaskWithSearchAreaUsage) => {
+  const getCachedTokens = (task: ExecutionTask) => {
     const mainCached = task.usage?.cached_input || 0;
     const searchAreaCached = task.searchAreaUsage?.cached_input || 0;
     const total = mainCached + searchAreaCached;
@@ -308,18 +355,15 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
         // Token numbers length
         const promptTokens = String(
           (task.usage?.prompt_tokens || 0) +
-            ((task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-              ?.prompt_tokens || 0),
+            (task.searchAreaUsage?.prompt_tokens || 0),
         );
         const cachedTokens = String(
           (task.usage?.cached_input || 0) +
-            ((task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-              ?.cached_input || 0),
+            (task.searchAreaUsage?.cached_input || 0),
         );
         const completionTokens = String(
           (task.usage?.completion_tokens || 0) +
-            ((task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-              ?.completion_tokens || 0),
+            (task.searchAreaUsage?.completion_tokens || 0),
         );
 
         maxPromptLength = Math.max(maxPromptLength, promptTokens.length);
@@ -335,7 +379,7 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     // Use 9px per char to account for padding and ensure no overflow
     const charWidth = 9;
     const minWidths = {
-      time: 60,
+      time: 96,
       intent: 60,
       model: 80,
       prompt: 70,
@@ -376,7 +420,13 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
   const columnConfig = useMemo(() => {
     return [
       { key: 'type', label: 'Type', width: typeColumnMinWidth, flex: true },
-      { key: 'time', label: 'Time', width: dynamicWidths.time },
+      {
+        key: 'time',
+        label: 'Time',
+        width: dynamicWidths.time,
+        tooltip:
+          'Per-task elapsed time. The Total row separates the overall elapsed span from total model call duration.',
+      },
       ...(proModeEnabled
         ? [
             { key: 'intent', label: 'Intent', width: dynamicWidths.intent },
@@ -408,63 +458,51 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     ];
   }, [hasCachedInput, proModeEnabled, dynamicWidths]);
 
-  // Calculate total tokens by model
-  const tokensByModel = useMemo(() => {
-    const modelStats = new Map<
-      string,
-      { prompt: number; cachedInput: number; completion: number }
-    >();
+  const reportSummary = useMemo(() => {
+    if (!groupedDump) return null;
+    return collectReportSummary(groupedDump, {
+      wallTimeFallbackMs: playwrightAttributes?.playwright_test_duration,
+    });
+  }, [groupedDump, playwrightAttributes]);
 
-    groupedDump?.executions
-      .flatMap((e) => e.tasks)
-      .forEach((task) => {
-        // Skip tasks without usage information
-        if (!task.usage) return;
+  const timingSummaryTooltip = useMemo(() => {
+    if (!reportSummary) return null;
+    const { timing } = reportSummary;
+    const hasTaskTimestamps = timing.wallTimeSource === 'task-timestamps';
 
-        const modelName = task.usage.model_name || 'Unknown';
-        const mainPrompt = task.usage.prompt_tokens || 0;
-        const mainCompletion = task.usage.completion_tokens || 0;
-        const mainCached = task.usage.cached_input || 0;
-        const searchAreaPrompt =
-          (task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-            ?.prompt_tokens || 0;
-        const searchAreaCompletion =
-          (task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-            ?.completion_tokens || 0;
-        const searchAreaCached =
-          (task as ExecutionTaskWithSearchAreaUsage).searchAreaUsage
-            ?.cached_input || 0;
-
-        const existing = modelStats.get(modelName) || {
-          prompt: 0,
-          cachedInput: 0,
-          completion: 0,
-        };
-        modelStats.set(modelName, {
-          prompt: existing.prompt + mainPrompt + searchAreaPrompt,
-          cachedInput: existing.cachedInput + mainCached + searchAreaCached,
-          completion:
-            existing.completion + mainCompletion + searchAreaCompletion,
-        });
-      });
-
-    return modelStats;
-  }, [groupedDump]);
-
-  const totalPromptTokens = Array.from(tokensByModel.values()).reduce(
-    (sum, stats) => sum + stats.prompt,
-    0,
-  );
-
-  const totalCachedInputTokens = Array.from(tokensByModel.values()).reduce(
-    (sum, stats) => sum + stats.cachedInput,
-    0,
-  );
-
-  const totalCompletionTokens = Array.from(tokensByModel.values()).reduce(
-    (sum, stats) => sum + stats.completion,
-    0,
-  );
+    return (
+      <div className="total-time-tooltip-content">
+        <span className="total-time-tooltip-metric">Elapsed</span>
+        <span className="total-time-tooltip-description">
+          {hasTaskTimestamps
+            ? 'Total span from the first recorded task start to the last recorded task end, including model calls, actions, waits, and gaps.'
+            : timing.wallTimeSource === 'fallback'
+              ? 'Total elapsed duration reported by the enclosing test runner because task timestamps were unavailable.'
+              : 'The total elapsed span is unavailable because the report has no recorded task timestamps.'}
+        </span>
+        {hasTaskTimestamps && (
+          <>
+            <span className="total-time-tooltip-label">Start</span>
+            <span className="total-time-tooltip-value">
+              {fullTimeStrWithMilliseconds(timing.wallTimeStart)}
+            </span>
+            <span className="total-time-tooltip-label">End</span>
+            <span className="total-time-tooltip-value">
+              {fullTimeStrWithMilliseconds(timing.wallTimeEnd)}
+            </span>
+          </>
+        )}
+        <span className="total-time-tooltip-metric">Model</span>
+        <span className="total-time-tooltip-description">
+          Total duration of all recorded model calls.
+        </span>
+        <span className="total-time-tooltip-label">Calls</span>
+        <span className="total-time-tooltip-value">
+          {timing.modelCallCount}
+        </span>
+      </div>
+    );
+  }, [reportSummary]);
 
   // Keyboard navigation
   useEffect(() => {
@@ -502,19 +540,22 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
     [groupedDump].map((group, groupIndex) => {
       return (
         <div key={groupIndex}>
-          <ReportOverview title={group.groupName} dumps={dumps} />
+          <ReportOverview
+            title={group.groupName}
+            dumps={dumps}
+            onCaseChange={onReportCaseChange}
+          />
         </div>
       );
     })
   ) : (
     <span>no tasks</span>
   );
+  const showReportOverview =
+    reportViewMode === 'human' || (dumps?.length ?? 0) > 1;
 
   // Render cell content based on column key
-  const renderCellContent = (
-    columnKey: string,
-    task: ExecutionTaskWithSearchAreaUsage,
-  ) => {
+  const renderCellContent = (columnKey: string, task: ExecutionTask) => {
     switch (columnKey) {
       case 'type': {
         const taskName =
@@ -529,7 +570,9 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
             {getCacheTag(task)}
             {getDomIncludedTag(task)}
             {getDeepLocateTag(task)}
+            {getXPathTag(task)}
             {getDeepThinkTag(task)}
+            {getObservedTag(task)}
           </div>
         );
       }
@@ -598,8 +641,14 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
           <div className="table-body">
             {tableData.map((record) => {
               if (record.isGroupHeader) {
+                // Group headers are not selectable; the id only makes them a
+                // plain `#group-<index>` scroll target, with no hash sync.
                 return (
-                  <div key={record.key} className="group-header-row">
+                  <div
+                    key={record.key}
+                    id={record.key}
+                    className="group-header-row"
+                  >
                     <div className="side-sub-title">{record.groupName}</div>
                   </div>
                 );
@@ -609,10 +658,14 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
               const isSelected = task === activeTask;
               const isPlaying = task === playingTask;
               const taskId = task.taskId;
+              // Single source of truth for the anchor format so the row id,
+              // the hash we write, and the hash we resolve never drift apart.
+              const anchorId = anchorIdForTask(task);
 
               return (
                 <div
                   key={record.key}
+                  id={anchorId}
                   data-task-id={taskId}
                   className={`task-row ${isSelected ? 'selected' : ''} ${isPlaying ? 'playing' : ''}`}
                   onClick={() => {
@@ -652,128 +705,256 @@ const Sidebar = (props: SidebarProps = {}): JSX.Element => {
           </div>
 
           {/* Summary */}
-          {proModeEnabled && (
-            <div className="table-summary">
-              <div className="side-seperator side-seperator-line side-seperator-space-up" />
-              {(() => {
-                const modelEntries = Array.from(tokensByModel.entries());
-                const hasMultipleModels = modelEntries.length > 1;
-
-                return hasMultipleModels
-                  ? modelEntries.map(([modelName, stats]) => (
-                      <div key={modelName} className="summary-row">
-                        <div
-                          className="summary-cell column-type"
-                          style={{
-                            minWidth: typeColumnMinWidth,
-                            flex: 1,
-                          }}
-                        >
-                          <div className="token-total-label">
-                            {modelName}
-                            <Tag bordered={false} style={{ marginLeft: '8px' }}>
-                              Total
-                            </Tag>
-                          </div>
-                        </div>
-                        <div
-                          className="summary-cell column-prompt"
-                          style={{ width: dynamicWidths.prompt }}
-                        >
-                          <span className="token-value">{stats.prompt}</span>
-                        </div>
-                        {hasCachedInput && (
-                          <div
-                            className="summary-cell column-cached"
-                            style={{ width: dynamicWidths.cached }}
-                          >
-                            <span className="token-value">
-                              {stats.cachedInput}
-                            </span>
-                          </div>
+          <div className="table-summary">
+            <div className="side-seperator side-seperator-line side-seperator-space-up" />
+            {/* Grand total: timing is always visible; tokens appear in pro mode. */}
+            <div className="summary-row total-summary-row">
+              <div
+                className="summary-cell column-type"
+                style={{
+                  minWidth: typeColumnMinWidth,
+                  flex: 1,
+                }}
+              >
+                <div className="token-total-label">Total</div>
+              </div>
+              <div
+                className="summary-cell column-time"
+                style={{ width: dynamicWidths.time }}
+              >
+                <Tooltip
+                  title={timingSummaryTooltip}
+                  rootClassName="total-time-tooltip"
+                  placement="topLeft"
+                >
+                  <div className="summary-time-values">
+                    <span className="summary-time-item">
+                      <span className="summary-time-label">Elapsed</span>
+                      <span className="summary-time-value">
+                        {timeCostStrElement(reportSummary?.timing.wallTimeMs)}
+                      </span>
+                    </span>
+                    <span className="summary-time-item">
+                      <span className="summary-time-label">Model</span>
+                      <span className="summary-time-value">
+                        {timeCostStrElement(
+                          reportSummary?.timing.modelCallTimeMs,
                         )}
-                        <div
-                          className="summary-cell column-completion"
-                          style={{ width: dynamicWidths.completion }}
-                        >
-                          <span className="token-value">
-                            {stats.completion}
-                          </span>
-                        </div>
-                      </div>
-                    ))
-                  : [
-                      <div key="total" className="summary-row">
-                        <div
-                          className="summary-cell column-type"
-                          style={{
-                            minWidth: typeColumnMinWidth,
-                            flex: 1,
-                          }}
-                        >
-                          <div className="token-total-label">Total</div>
-                        </div>
-                        <div
-                          className="summary-cell column-prompt"
-                          style={{ width: dynamicWidths.prompt }}
-                        >
-                          <span className="token-value">
-                            {totalPromptTokens}
-                          </span>
-                        </div>
-                        {hasCachedInput && (
-                          <div
-                            className="summary-cell column-cached"
-                            style={{ width: dynamicWidths.cached }}
-                          >
-                            <span className="token-value">
-                              {totalCachedInputTokens}
-                            </span>
-                          </div>
-                        )}
-                        <div
-                          className="summary-cell column-completion"
-                          style={{ width: dynamicWidths.completion }}
-                        >
-                          <span className="token-value">
-                            {totalCompletionTokens}
-                          </span>
-                        </div>
-                      </div>,
-                    ];
-              })()}
+                      </span>
+                    </span>
+                  </div>
+                </Tooltip>
+              </div>
+              {proModeEnabled && (
+                <>
+                  <div
+                    className="summary-cell column-intent"
+                    style={{ width: dynamicWidths.intent }}
+                  />
+                  <div
+                    className="summary-cell column-model"
+                    style={{ width: dynamicWidths.model }}
+                  />
+                  <div
+                    className="summary-cell column-prompt"
+                    style={{ width: dynamicWidths.prompt }}
+                  >
+                    <span className="token-value">
+                      {reportSummary?.tokens.promptTokens ?? 0}
+                    </span>
+                  </div>
+                  {hasCachedInput && (
+                    <div
+                      className="summary-cell column-cached"
+                      style={{ width: dynamicWidths.cached }}
+                    >
+                      <span className="token-value">
+                        {reportSummary?.tokens.cachedInputTokens ?? 0}
+                      </span>
+                    </div>
+                  )}
+                  <div
+                    className="summary-cell column-completion"
+                    style={{ width: dynamicWidths.completion }}
+                  >
+                    <span className="token-value">
+                      {reportSummary?.tokens.completionTokens ?? 0}
+                    </span>
+                  </div>
+                </>
+              )}
             </div>
-          )}
+
+            {/* Keep per-model subtotals when the report used multiple models. */}
+            {proModeEnabled &&
+              reportSummary &&
+              reportSummary.models.length > 1 &&
+              reportSummary.models.map((model) => (
+                <div key={model.modelName} className="summary-row">
+                  <div
+                    className="summary-cell column-type"
+                    style={{
+                      minWidth: typeColumnMinWidth,
+                      flex: 1,
+                    }}
+                  >
+                    <div className="token-total-label">
+                      {model.modelName}
+                      <Tag bordered={false} style={{ marginLeft: '8px' }}>
+                        Subtotal
+                      </Tag>
+                    </div>
+                  </div>
+                  <div
+                    className="summary-cell column-prompt"
+                    style={{ width: dynamicWidths.prompt }}
+                  >
+                    <span className="token-value">{model.promptTokens}</span>
+                  </div>
+                  {hasCachedInput && (
+                    <div
+                      className="summary-cell column-cached"
+                      style={{ width: dynamicWidths.cached }}
+                    >
+                      <span className="token-value">
+                        {model.cachedInputTokens}
+                      </span>
+                    </div>
+                  )}
+                  <div
+                    className="summary-cell column-completion"
+                    style={{ width: dynamicWidths.completion }}
+                  >
+                    <span className="token-value">
+                      {model.completionTokens}
+                    </span>
+                  </div>
+                </div>
+              ))}
+          </div>
         </div>
         {/* fork: "How to insert a custom log entry? Learn more" tip removed */}
       </div>
     </div>
   ) : null;
 
+  let agentMarkdownContent: JSX.Element;
+  if (reportMarkdownView?.status === 'ready') {
+    agentMarkdownContent = (
+      <div className="agent-markdown-sidebar">
+        <MarkdownSource
+          markdown={reportMarkdownView.markdown}
+          onImageClick={onMarkdownImageClick}
+          scrollContainerRef={markdownScrollContainerRef}
+        />
+      </div>
+    );
+  } else if (reportMarkdownView?.status === 'error') {
+    agentMarkdownContent = (
+      <div className="agent-markdown-sidebar">
+        <Alert
+          type="error"
+          showIcon
+          message="Failed to render markdown"
+          description={reportMarkdownView.errorMessage}
+        />
+      </div>
+    );
+  } else {
+    agentMarkdownContent = (
+      <div className="agent-markdown-sidebar empty">No report markdown</div>
+    );
+  }
+
+  const pageNavToolbar =
+    reportViewMode === 'markdown' ? (
+      <div className="page-nav-toolbar report-markdown-sidebar-actions">
+        <Tooltip title="Copy report.md markdown">
+          <Button
+            type="text"
+            size="small"
+            icon={<CopyOutlined />}
+            disabled={reportMarkdownActionsDisabled}
+            onClick={onCopyReportMarkdown}
+            aria-label="Copy report markdown"
+          />
+        </Tooltip>
+        <Tooltip title={markdownZipDownloadTooltip}>
+          <Button
+            type="text"
+            size="small"
+            icon={<DownloadOutlined />}
+            disabled={reportMarkdownActionsDisabled}
+            onClick={onDownloadReportMarkdownZip}
+            aria-label="Download markdown and images ZIP"
+          />
+        </Tooltip>
+      </div>
+    ) : (
+      <div className="page-nav-toolbar">
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="Replay all tasks"
+          onClick={() => {
+            setReplayAllMode?.(true);
+          }}
+        >
+          <PlayIcon />
+        </button>
+      </div>
+    );
+
+  const reportViewModeSwitch = (
+    <fieldset className="report-view-mode-switch" aria-label="Report view">
+      <Tooltip title="Human View">
+        <button
+          type="button"
+          className={`report-view-mode-button ${
+            reportViewMode === 'human' ? 'active' : ''
+          }`}
+          aria-label="Human View"
+          aria-pressed={reportViewMode === 'human'}
+          onClick={() => onReportViewModeChange?.('human')}
+        >
+          <MessageIcon width={16} height={16} />
+        </button>
+      </Tooltip>
+      <Tooltip title="Markdown View">
+        <button
+          type="button"
+          className={`report-view-mode-button ${
+            reportViewMode === 'markdown' ? 'active' : ''
+          }`}
+          aria-label="Markdown View"
+          aria-pressed={reportViewMode === 'markdown'}
+          onClick={() => onReportViewModeChange?.('markdown')}
+        >
+          <FileMarkdownOutlined />
+        </button>
+      </Tooltip>
+    </fieldset>
+  );
+
   return (
-    <div className="side-bar">
+    <div className={`side-bar ${reportViewMode}-view`}>
       <div className="page-nav">
         <div className="page-nav-left">
-          <div className="page-nav-title">
-            Report
-            <span className="page-nav-title-hint">
-              Switch: Command + Up / Down
-            </span>
-          </div>
-          <div className="page-nav-toolbar">
-            <div
-              className="icon-button"
-              onClick={() => {
-                setReplayAllMode?.(true);
-              }}
-            >
-              <PlayIcon />
+          <div className="page-nav-top">
+            <div className="page-nav-leading">
+              {reportViewModeSwitch}
+              {reportViewMode === 'human' && (
+                <div className="page-nav-title">
+                  Switch: Command + Up / Down
+                </div>
+              )}
             </div>
+            {pageNavToolbar}
           </div>
         </div>
       </div>
-      {sideList}
-      {executionContent}
+      {showReportOverview && sideList}
+      {reportViewMode === 'markdown' ? agentMarkdownContent : executionContent}
     </div>
   );
 };

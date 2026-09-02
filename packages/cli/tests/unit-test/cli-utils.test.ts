@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { matchYamlFiles, parseProcessArgs } from '@/cli-utils';
 import { launchServer } from '@/create-yaml-player';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test } from '@rstest/core';
 
 (global as any).__VERSION__ = '0.0.0-test';
 
@@ -62,6 +62,21 @@ describe('parseProcessArgs', () => {
     const { path, files } = await parseProcessArgs();
     expect(path).toBeUndefined();
     expect(files).toEqual(['file1.yml', 'file2.yml']);
+  });
+
+  test('should parse --setup argument', async () => {
+    process.argv = [
+      'node',
+      'midscene',
+      '--setup',
+      'login.yml',
+      '--files',
+      'search.yml',
+      'report.yml',
+    ];
+    const { files, options } = await parseProcessArgs();
+    expect(files).toEqual(['search.yml', 'report.yml']);
+    expect(options.setup).toBe('login.yml');
   });
 
   test('should parse --config argument', async () => {
@@ -210,31 +225,27 @@ describe('parseProcessArgs', () => {
     expect(options.concurrent).toBe(10);
   });
 
-  test('should auto-parse iOS device options', async () => {
+  test('should auto-parse iOS WDA options', async () => {
     process.argv = [
       'node',
       'midscene',
-      '--ios.device-id',
-      '00008110-001234567890',
       '--ios.wda-port',
       '8100',
       '--ios.wda-host',
       '192.168.1.100',
-      '--ios.use-wda',
-      'true',
+      '--ios.session-id',
+      'external-session-id',
       '--ios.auto-dismiss-keyboard',
       'true',
     ];
     const { options } = await parseProcessArgs();
     expect(options.ios).toEqual({
-      'device-id': '00008110-001234567890',
-      deviceId: '00008110-001234567890',
       'wda-port': 8100,
       wdaPort: 8100,
       'wda-host': '192.168.1.100',
       wdaHost: '192.168.1.100',
-      'use-wda': 'true',
-      useWda: 'true',
+      'session-id': 'external-session-id',
+      sessionId: 'external-session-id',
       'auto-dismiss-keyboard': 'true',
       autoDismissKeyboard: 'true',
     });
@@ -250,6 +261,8 @@ describe('parseProcessArgs', () => {
       '/custom/path/to/adb',
       '--android.ime-strategy',
       'yadb-for-non-ascii',
+      '--android.screenshot-strategy',
+      'always-yadb',
       '--android.remote-adb-host',
       '192.168.1.100',
       '--android.remote-adb-port',
@@ -269,6 +282,8 @@ describe('parseProcessArgs', () => {
       androidAdbPath: '/custom/path/to/adb',
       'ime-strategy': 'yadb-for-non-ascii',
       imeStrategy: 'yadb-for-non-ascii',
+      'screenshot-strategy': 'always-yadb',
+      screenshotStrategy: 'always-yadb',
       'remote-adb-host': '192.168.1.100',
       remoteAdbHost: '192.168.1.100',
       'remote-adb-port': 5037,
@@ -296,8 +311,8 @@ describe('parseProcessArgs', () => {
       'always-yadb',
       '--ios.wda-port',
       '8100',
-      '--ios.device-id',
-      'test-ios',
+      '--ios.wda-host',
+      '127.0.0.1',
     ];
     const { options } = await parseProcessArgs();
 
@@ -321,8 +336,8 @@ describe('parseProcessArgs', () => {
     expect(options.ios).toEqual({
       'wda-port': 8100,
       wdaPort: 8100,
-      'device-id': 'test-ios',
-      deviceId: 'test-ios',
+      'wda-host': '127.0.0.1',
+      wdaHost: '127.0.0.1',
     });
   });
 

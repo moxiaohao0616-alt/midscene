@@ -4,10 +4,8 @@ import { pluginLess } from '@rsbuild/plugin-less';
 import { pluginNodePolyfill } from '@rsbuild/plugin-node-polyfill';
 import { pluginReact } from '@rsbuild/plugin-react';
 import { pluginSvgr } from '@rsbuild/plugin-svgr';
-import {
-  commonIgnoreWarnings,
-  createTypeCheckPlugin,
-} from '../../scripts/rsbuild-utils.ts';
+import { pluginTypeCheck } from '@rsbuild/plugin-type-check';
+import { commonIgnoreWarnings } from '../../scripts/rsbuild-utils.ts';
 import { version as appVersion } from './package.json';
 import {
   rendererDevHost,
@@ -18,8 +16,6 @@ import {
 // `file://` HTML. A relative prefix works in both places; an absolute
 // `/static/...` prefix leaves packaged/build smoke runs with a blank renderer.
 const rendererAssetPrefix = './';
-const studioRecorderEntryEnabled =
-  process.env.VITE_STUDIO_RECORDER_ENABLED !== 'false';
 
 export default defineConfig({
   source: {
@@ -51,7 +47,17 @@ export default defineConfig({
     }),
     pluginLess(),
     pluginNodePolyfill(),
-    createTypeCheckPlugin(),
+    pluginTypeCheck({
+      tsCheckerOptions: {
+        typescript: {
+          // Studio aliases workspace renderer packages to source entries above;
+          // type checking must follow project references so package imports keep
+          // their generated declaration boundaries instead of falling through to
+          // dist/*.mjs during dev watch rebuilds.
+          build: true,
+        },
+      },
+    }),
   ],
   resolve: {
     alias: {
@@ -98,6 +104,10 @@ export default defineConfig({
         __dirname,
         '../../packages/visualizer/src/utils/index.ts',
       ),
+      // Studio performs image processing in the Electron main process with
+      // Sharp. Photon remains available only to browser-only consumers such
+      // as the extension.
+      '@silvia-odwyer/photon': false,
       undici: false,
       'fetch-socks': false,
     },
@@ -113,9 +123,6 @@ export default defineConfig({
         },
         define: {
           __APP_VERSION__: JSON.stringify(appVersion),
-          __STUDIO_RECORDER_ENTRY_ENABLED__: JSON.stringify(
-            studioRecorderEntryEnabled,
-          ),
         },
       },
       output: {
@@ -138,6 +145,10 @@ export default defineConfig({
             import: './src/main/index.ts',
             html: false,
           },
+          'scrcpy-worker': {
+            import: './src/main/playground/scrcpy-worker.ts',
+            html: false,
+          },
         },
       },
       output: {
@@ -151,6 +162,12 @@ export default defineConfig({
         externals: [
           'electron',
           'electron-updater',
+          'sharp',
+          // Playground is loaded from its packaged CommonJS build at runtime.
+          // Keep Shared external too, so Studio's process-local run-directory
+          // configuration and Playground's Recorder use the same module
+          // instance instead of separate bundled and disk-loaded copies.
+          /^@midscene\/shared(?:\/.*)?$/,
           '@midscene/android',
           '@midscene/android-playground',
           '@midscene/computer',
@@ -158,6 +175,7 @@ export default defineConfig({
           '@midscene/harmony',
           '@midscene/ios',
           '@midscene/playground',
+          '@midscene/playground/recorder-ui-describer',
         ],
         sourceMap: true,
       },

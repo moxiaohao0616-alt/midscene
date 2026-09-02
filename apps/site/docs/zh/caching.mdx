@@ -22,7 +22,10 @@ Midscene 的缓存机制基于输入的稳定性和输出的可复用性。当�
 - **任务指令缓存**：对于规划类操作（如 `ai`、`aiAct`），Midscene 会将 prompt 指令作为缓存键，存储 AI 返回的执行计划
 - **元素定位缓存（仅 Web）**：对于定位类操作（如 `aiLocate`、`aiTap`），系统会将定位 prompt 作为缓存键，存储元素的 XPath 信息，下次执行时先验证 XPath 是否仍然有效
 - **失效机制**：当缓存失效时，系统会自动回退到 AI 模型重新分析
+- **规划缓存回退**：如果缓存的 `aiAct` 规划在运行时失败，例如偶现弹窗本次没有出现，Midscene 会在本次运行中回退到正常 AI 规划，并清空这条过期规划缓存的 flow
 - **永不缓存查询结果**：查询类操作（如 `aiBoolean`、`aiQuery`、`aiAssert`）不会被缓存
+
+当发生规划缓存回退时，即使本次回退规划成功，Midscene 也不会把回退生成的 flow 写回原 prompt 的规划缓存。因为失败前的缓存步骤可能已经部分改变页面状态，回退规划得到的 flow 不一定适用于从初始页面重新执行。下一次运行相同 prompt 时，这条空 flow 会被视为不可用缓存，并重新生成完整的规划缓存。
 
 缓存内容会保存到 `./midscene_run/cache` 目录下，以 `.cache.yaml` 为扩展名。
 
@@ -324,7 +327,7 @@ test.afterEach(async ({ page, agentForPage }) => {
 
 你可以使用 `cacheable` 选项来禁用单个 API 的缓存。
 
-具体用法请参考对应 [API](./api.mdx) 的文档。
+具体用法请参考对应 [API](./reference/#common) 的文档。
 
 ### 使用 XPath 缓存元素定位信息的局限性
 

@@ -1,5 +1,6 @@
 import type { ConnectivityTestResult, DeviceAction } from '@midscene/core';
 import type { Agent } from '@midscene/core/agent';
+import type { TModelConfig } from '@midscene/shared/env';
 
 export interface PlaygroundAgent extends Agent {
   [key: string]: any; // Allow dynamic method access for backward compatibility
@@ -19,15 +20,30 @@ export interface ValidationResult {
 export interface ServerResponse {
   result?: unknown;
   dump?: any;
-  reportHTML?: string;
+  reportHTML?: string | null;
+  report?: PlaygroundReportRef | null;
   error?: string;
+}
+
+export interface PlaygroundReportRef {
+  id: string;
+  url: string;
+  replayUrl?: string;
+  bytes: number;
+  format?: 'single-html' | 'html-and-external-assets';
 }
 
 export interface DeviceOptions {
   imeStrategy?: 'always-yadb' | 'yadb-for-non-ascii';
+  screenshotStrategy?: 'auto' | 'always-yadb';
   autoDismissKeyboard?: boolean;
   keyboardDismissStrategy?: 'esc-first' | 'back-first';
   alwaysRefreshScreenInfo?: boolean;
+}
+
+export interface ExecutionReportDisplay {
+  type?: string;
+  prompt?: string;
 }
 
 export interface ExecutionOptions {
@@ -38,7 +54,9 @@ export interface ExecutionOptions {
   planningStrategy?: 'fast' | 'standard';
   context?: any;
   requestId?: string;
+  abortSignal?: AbortSignal;
   deviceOptions?: DeviceOptions;
+  reportDisplay?: ExecutionReportDisplay;
 }
 
 export type BeforeActionHook = (
@@ -113,5 +131,5 @@ export interface PlaygroundAdapter {
   ): Promise<unknown>;
 
   getActionSpace?(context: any): Promise<DeviceAction<unknown>[]>;
-  runConnectivityTest?(): Promise<ConnectivityTestResult>;
+  runConnectivityTest?(config: TModelConfig): Promise<ConnectivityTestResult>;
 }

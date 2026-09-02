@@ -1,9 +1,26 @@
 import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  type ObservationArtifactAdapter,
+  observationArtifactAdapterSymbol,
+} from '@/agent-tools/observation-artifact';
+import {
   generateCommonTools,
   generateToolsFromActionSpace,
-} from '@/mcp/tool-generator';
-import { composeUserPrompt } from '@/mcp/user-prompt';
-import { describe, expect, it, vi } from 'vitest';
+} from '@/agent-tools/tool-generator';
+import { composeUserPrompt } from '@/agent-tools/user-prompt';
+import { withCliVerboseContext } from '@/cli';
+import * as cliInterrupt from '@/cli/interrupt';
+import { createRecordCliCommand } from '@/cli/record-command';
+import { describe, expect, it, rs } from '@rstest/core';
 import { z } from 'zod';
 
 const multimodalPromptSchema = z.object({
@@ -41,15 +58,25 @@ const actionSpace = [
 
 const screenshotBase64 = 'data:image/png;base64,Zm9v';
 
+function withObservationArtifactAdapter<T extends object>(
+  agent: T,
+  adapter: ObservationArtifactAdapter,
+): T {
+  Object.defineProperty(agent, observationArtifactAdapterSymbol, {
+    value: adapter,
+  });
+  return agent;
+}
+
 describe('generateToolsFromActionSpace', () => {
   it('passes structured locate extras through callActionInActionSpace and keeps locate options at top level', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const page = {
-      screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+      screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
     };
     const [tool] = generateToolsFromActionSpace(actionSpace, async () => ({
       callActionInActionSpace,
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page,
     }));
 
@@ -88,12 +115,12 @@ describe('generateToolsFromActionSpace', () => {
   });
 
   it('normalizes string locate shorthand before direct action execution', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(actionSpace, async () => ({
       callActionInActionSpace,
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page: {
-        screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+        screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
       },
     }));
 
@@ -108,13 +135,35 @@ describe('generateToolsFromActionSpace', () => {
     });
   });
 
+  it('preserves locate field descriptions after making locate.prompt optional', () => {
+    const [tool] = generateToolsFromActionSpace(
+      [
+        {
+          name: 'Tap',
+          description: 'Tap the element',
+          paramSchema: z.object({
+            locate: locateSchema.describe('The element to be tapped'),
+          }),
+        },
+      ],
+      async () => ({
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: {
+          screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
+        },
+      }),
+    );
+
+    expect(tool.schema.locate.description).toBe('The element to be tapped');
+  });
+
   it('falls back to aiAction when direct action execution is unavailable', async () => {
-    const aiAction = vi.fn().mockResolvedValue(undefined);
+    const aiAction = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(actionSpace, async () => ({
       aiAction,
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page: {
-        screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+        screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
       },
     }));
 
@@ -130,7 +179,7 @@ describe('generateToolsFromActionSpace', () => {
   });
 
   it('includes direct action return values in the tool result', async () => {
-    const callActionInActionSpace = vi
+    const callActionInActionSpace = rs
       .fn()
       .mockResolvedValue('pm clear output');
     const [tool] = generateToolsFromActionSpace(
@@ -145,9 +194,9 @@ describe('generateToolsFromActionSpace', () => {
       ],
       async () => ({
         callActionInActionSpace,
-        getActionSpace: vi.fn().mockResolvedValue([]),
+        getActionSpace: rs.fn().mockResolvedValue([]),
         page: {
-          screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+          screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
         },
       }),
     );
@@ -169,14 +218,14 @@ describe('generateToolsFromActionSpace', () => {
   });
 
   it('passes raw args to the agent getter while stripping init args from action payload', async () => {
-    const callActionInActionSpace = vi
+    const callActionInActionSpace = rs
       .fn()
       .mockResolvedValue('pm clear output');
-    const getAgent = vi.fn().mockResolvedValue({
+    const getAgent = rs.fn().mockResolvedValue({
       callActionInActionSpace,
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page: {
-        screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+        screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
       },
     });
     const [tool] = generateToolsFromActionSpace(
@@ -222,9 +271,9 @@ describe('generateToolsFromActionSpace', () => {
     const [actionTool] = generateToolsFromActionSpace(
       actionSpace,
       async () => ({
-        getActionSpace: vi.fn().mockResolvedValue([]),
+        getActionSpace: rs.fn().mockResolvedValue([]),
         page: {
-          screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+          screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
         },
       }),
       undefined,
@@ -233,9 +282,9 @@ describe('generateToolsFromActionSpace', () => {
     );
     const commonTools = generateCommonTools(
       async () => ({
-        getActionSpace: vi.fn().mockResolvedValue([]),
+        getActionSpace: rs.fn().mockResolvedValue([]),
         page: {
-          screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+          screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
         },
       }),
       initArgSchema,
@@ -261,6 +310,35 @@ describe('generateToolsFromActionSpace', () => {
       initArgCliMetadata,
     );
 
+    const recordTool = createRecordCliCommand(
+      async () => ({
+        getActionSpace: rs.fn().mockResolvedValue([]),
+      }),
+      initArgSchema,
+      initArgCliMetadata,
+    );
+    expect(commonTools.find((tool) => tool.name === 'record')).toBeUndefined();
+    expect(recordTool.schema).toEqual(
+      expect.objectContaining({
+        action: expect.anything(),
+        output: expect.anything(),
+        'android.deviceId': expect.anything(),
+      }),
+    );
+    expect(recordTool.cli).toEqual({
+      positionals: ['action'],
+      options: expect.objectContaining({
+        intervalMs: {
+          preferredName: 'interval-ms',
+          aliases: ['intervalMs'],
+        },
+        'android.deviceId': {
+          preferredName: 'device-id',
+          aliases: ['deviceId'],
+        },
+      }),
+    });
+
     expect(commonTools.find((tool) => tool.name === 'assert')?.schema).toEqual(
       expect.objectContaining({
         prompt: expect.anything(),
@@ -273,24 +351,26 @@ describe('generateToolsFromActionSpace', () => {
   });
 
   it('includes aiAction return values in the common act tool result', async () => {
-    const aiAction = vi.fn().mockResolvedValue('Midscene');
+    const aiAction = rs.fn().mockResolvedValue('Midscene');
     const commonTools = generateCommonTools(async () => ({
       aiAction,
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page: {
-        screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64),
+        screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
       },
     }));
     const actTool = commonTools.find((tool) => tool.name === 'act');
 
     const result = await actTool?.handler({
       prompt: 'return the first Google result heading for Midscene',
+      fileChooserAllowedDir: './fixtures',
     });
 
     expect(aiAction).toHaveBeenCalledWith(
       'return the first Google result heading for Midscene',
       {
         deepThink: false,
+        fileChooserAllowedDir: './fixtures',
       },
     );
     expect(result).toEqual({
@@ -302,11 +382,158 @@ describe('generateToolsFromActionSpace', () => {
     });
   });
 
+  it('stops a foreground recording on Ctrl+C before writing its artifact', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'midscene-record-test-'));
+    const output = join(tempDir, 'toast-observation.json');
+    const sourceFrame = join(tempDir, 'source.png');
+    writeFileSync(sourceFrame, Buffer.from('recorded-frame'));
+    const dispose = rs.fn().mockResolvedValue(undefined);
+    const exportRecord = rs.fn().mockResolvedValue({
+      type: 'midscene_ui_observation',
+      version: 1,
+      startedAt: 50,
+      endedAt: 150,
+      frames: [
+        {
+          path: sourceFrame,
+          mimeType: 'image/png',
+          capturedAt: 100,
+        },
+      ],
+      shotSize: { width: 100, height: 50 },
+      shrunkShotToLogicalRatio: 1,
+    });
+    const stop = rs.fn().mockResolvedValue({
+      frameCount: 1,
+      startedAt: 50,
+      endedAt: 150,
+      aiAssert: rs.fn(),
+    });
+    const startObserving = rs.fn().mockResolvedValue({
+      stop,
+      bufferedFrameCount: 1,
+      dispose,
+    });
+    const getAgent = rs.fn(async () =>
+      withObservationArtifactAdapter(
+        {
+          startObserving,
+          getActionSpace: rs.fn().mockResolvedValue([]),
+          page: {
+            screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
+          },
+        },
+        {
+          exportRecord,
+          loadRecord: rs.fn(),
+        },
+      ),
+    );
+    const recordTool = createRecordCliCommand(getAgent);
+    const interruptDispose = rs.fn();
+    const interruptSpy = rs
+      .spyOn(cliInterrupt, 'createCliInterruptWaiter')
+      .mockReturnValue({
+        result: Promise.resolve('sigint'),
+        dispose: interruptDispose,
+      });
+
+    const result = await withCliVerboseContext(
+      {
+        enabled: false,
+        scriptName: 'midscene-web',
+        commandName: 'record',
+      },
+      () =>
+        recordTool.handler({
+          action: 'start',
+          output,
+          intervalMs: 250,
+          maxFrames: 12,
+          watchdogMs: 5000,
+        }),
+    );
+
+    expect(startObserving).toHaveBeenCalledWith({
+      intervalMs: 250,
+      maxFrames: 12,
+      watchdogMs: 5000,
+    });
+    expect(interruptSpy).toHaveBeenCalledWith(5000);
+    expect(getAgent).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(exportRecord).toHaveBeenCalledOnce();
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(interruptDispose).toHaveBeenCalledOnce();
+    expect(existsSync(output)).toBe(true);
+    expect(startObserving.mock.invocationCallOrder[0]).toBeLessThan(
+      stop.mock.invocationCallOrder[0],
+    );
+    expect(dispose.mock.invocationCallOrder[0]).toBeLessThan(
+      interruptDispose.mock.invocationCallOrder[0],
+    );
+    expect(result).toEqual({
+      content: [{ type: 'text', text: `Observation record saved: ${output}` }],
+    });
+    interruptSpy.mockRestore();
+    rmSync(tempDir, { recursive: true });
+  });
+
+  it('fails clearly when startObserving is unavailable', async () => {
+    const consoleErrorSpy = rs
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const recordTool = createRecordCliCommand(async () => ({
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: {
+        screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
+      },
+    }));
+
+    const result = await withCliVerboseContext(
+      {
+        enabled: false,
+        scriptName: 'midscene-web',
+        commandName: 'record',
+      },
+      () => recordTool.handler({ action: 'start' }),
+    );
+
+    expect(result).toEqual({
+      content: [
+        {
+          type: 'text',
+          text: 'Failed to execute record: record is not supported because this agent does not provide startObserving',
+        },
+      ],
+      isError: true,
+    });
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('rejects a missing record operation before creating an agent', async () => {
+    const getAgent = rs.fn();
+    const recordTool = createRecordCliCommand(getAgent);
+
+    const missingAction = await recordTool.handler({});
+
+    expect(getAgent).not.toHaveBeenCalled();
+    expect(missingAction).toEqual({
+      content: [
+        {
+          type: 'text',
+          text: 'record requires the start operation (for example: record start --output ./observation.json)',
+        },
+      ],
+      isError: true,
+    });
+  });
+
   it('records take_screenshot in reports with the captured screenshot', async () => {
-    const screenshotBase64Fn = vi.fn().mockResolvedValue(screenshotBase64);
-    const recordToReport = vi.fn().mockResolvedValue(undefined);
+    const screenshotBase64Fn = rs.fn().mockResolvedValue(screenshotBase64);
+    const recordToReport = rs.fn().mockResolvedValue(undefined);
     const commonTools = generateCommonTools(async () => ({
-      getActionSpace: vi.fn().mockResolvedValue([]),
+      getActionSpace: rs.fn().mockResolvedValue([]),
       page: {
         screenshotBase64: screenshotBase64Fn,
       },
@@ -499,11 +726,11 @@ describe('generateCommonTools — assert image prompts', () => {
   const screenshotBase64 = 'data:image/png;base64,Zm9v';
 
   it('passes prompt through unchanged when no images are supplied', async () => {
-    const aiAssert = vi.fn().mockResolvedValue(undefined);
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
     const tools = generateCommonTools(async () => ({
       aiAssert,
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     const assert = tools.find((t) => t.name === 'assert')!;
@@ -513,11 +740,11 @@ describe('generateCommonTools — assert image prompts', () => {
   });
 
   it('forwards the custom failure message to aiAssert', async () => {
-    const aiAssert = vi.fn().mockResolvedValue(undefined);
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
     const tools = generateCommonTools(async () => ({
       aiAssert,
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     const assert = tools.find((t) => t.name === 'assert')!;
@@ -532,12 +759,147 @@ describe('generateCommonTools — assert image prompts', () => {
     );
   });
 
-  it('forwards images to aiAssert as a TUserPrompt-style object', async () => {
-    const aiAssert = vi.fn().mockResolvedValue(undefined);
+  it('loads an observation record and forwards it to aiAssert', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'midscene-assert-record-test-'));
+    const recordPath = join(tempDir, 'toast-observation.json');
+    const framesDir = join(tempDir, 'toast-observation.frames');
+    mkdirSync(framesDir, { recursive: true });
+    const framePath = join(framesDir, 'frame.png');
+    writeFileSync(framePath, Buffer.from('frame'));
+    const observationRecord = {
+      type: 'midscene_ui_observation' as const,
+      version: 1 as const,
+      startedAt: 50,
+      endedAt: 250,
+      frames: [
+        {
+          path: 'toast-observation.frames/frame.png',
+          mimeType: 'image/png' as const,
+          capturedAt: 100,
+        },
+        {
+          path: 'toast-observation.frames/frame.png',
+          mimeType: 'image/png' as const,
+          capturedAt: 200,
+        },
+      ],
+      shotSize: { width: 100, height: 100 },
+      shrunkShotToLogicalRatio: 1,
+    };
+    writeFileSync(recordPath, JSON.stringify(observationRecord), 'utf8');
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
+    const observationAssert = rs.fn().mockResolvedValue(undefined);
+    const dispose = rs.fn().mockResolvedValue(undefined);
+    const loadRecord = rs.fn().mockReturnValue({
+      frameCount: 2,
+      startedAt: 50,
+      endedAt: 250,
+      aiAssert: observationAssert,
+      dispose,
+    });
+    const tools = generateCommonTools(async () =>
+      withObservationArtifactAdapter(
+        {
+          aiAssert,
+          getActionSpace: rs.fn().mockResolvedValue([]),
+          page: {
+            screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64),
+          },
+        },
+        {
+          exportRecord: rs.fn(),
+          loadRecord,
+        },
+      ),
+    );
+
+    const assert = tools.find((t) => t.name === 'assert')!;
+    const result = await assert.handler({
+      prompt: 'a success toast appeared',
+      record: recordPath,
+    });
+
+    expect(loadRecord).toHaveBeenCalledWith({
+      ...observationRecord,
+      frames: observationRecord.frames.map((frame) => ({
+        ...frame,
+        path: framePath,
+      })),
+    });
+    expect(observationAssert).toHaveBeenCalledWith(
+      'a success toast appeared',
+      undefined,
+    );
+    expect(aiAssert).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'Assertion passed.' }],
+    });
+    rmSync(tempDir, { recursive: true });
+  });
+
+  it('rejects a record whose image path escapes the manifest directory', async () => {
+    const tempDir = mkdtempSync(
+      join(tmpdir(), 'midscene-invalid-record-test-'),
+    );
+    const recordPath = join(tempDir, 'invalid-observation.json');
+    writeFileSync(
+      recordPath,
+      JSON.stringify({
+        type: 'midscene_ui_observation',
+        version: 1,
+        startedAt: 50,
+        endedAt: 150,
+        frames: [
+          {
+            path: '../not-an-image.png',
+            mimeType: 'image/png',
+            capturedAt: 100,
+          },
+        ],
+        shotSize: { width: 100, height: 100 },
+        shrunkShotToLogicalRatio: 1,
+      }),
+      'utf8',
+    );
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
+    const consoleErrorSpy = rs
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
     const tools = generateCommonTools(async () => ({
       aiAssert,
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+
+    const assert = tools.find((tool) => tool.name === 'assert')!;
+    const result = await assert.handler({
+      prompt: 'a success toast appeared',
+      record: recordPath,
+    });
+
+    expect(aiAssert).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      content: [
+        {
+          type: 'text',
+          text: expect.stringContaining(
+            'Invalid UI observation record at frames.0.path',
+          ),
+        },
+      ],
+      isError: true,
+    });
+    consoleErrorSpy.mockRestore();
+    rmSync(tempDir, { recursive: true });
+  });
+
+  it('forwards images to aiAssert as a TUserPrompt-style object', async () => {
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
+    const tools = generateCommonTools(async () => ({
+      aiAssert,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     const assert = tools.find((t) => t.name === 'assert')!;
@@ -557,11 +919,11 @@ describe('generateCommonTools — assert image prompts', () => {
   });
 
   it('forwards a local-path url verbatim so core can resolve it', async () => {
-    const aiAssert = vi.fn().mockResolvedValue(undefined);
+    const aiAssert = rs.fn().mockResolvedValue(undefined);
     const tools = generateCommonTools(async () => ({
       aiAssert,
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     const assert = tools.find((t) => t.name === 'assert')!;
@@ -582,37 +944,111 @@ describe('generateCommonTools — assert image prompts', () => {
 
   it('exposes images and convertHttpImage2Base64 on the assert schema (no imageFiles flag)', () => {
     const tools = generateCommonTools(async () => ({
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     const assertSchema = tools.find((t) => t.name === 'assert')!.schema;
     expect(assertSchema).toHaveProperty('prompt');
     expect(assertSchema).toHaveProperty('message');
+    expect(assertSchema).toHaveProperty('record');
     expect(assertSchema).toHaveProperty('image');
     expect(assertSchema).toHaveProperty('imageName');
     expect(assertSchema).toHaveProperty('convertHttpImage2Base64');
     expect(assertSchema).not.toHaveProperty('images');
     expect(assertSchema).not.toHaveProperty('imageFiles');
 
-    // act schema stays string-only because the underlying core aiAct
-    // does not yet parse multimodal prompts.
+    // act mirrors assert: it exposes the same reference-image flags, which
+    // core aiAct forwards to the planner as reference images.
     const actSchema = tools.find((t) => t.name === 'act')!.schema;
     expect(actSchema).toHaveProperty('prompt');
+    expect(actSchema).toHaveProperty('image');
+    expect(actSchema).toHaveProperty('imageName');
+    expect(actSchema).toHaveProperty('convertHttpImage2Base64');
     expect(actSchema).not.toHaveProperty('images');
     expect(actSchema).not.toHaveProperty('imageFiles');
   });
 });
 
+describe('generateCommonTools — act image prompts', () => {
+  const screenshotBase64 = 'data:image/png;base64,Zm9v';
+
+  it('passes the prompt through unchanged when no images are supplied', async () => {
+    const aiAction = rs.fn().mockResolvedValue(undefined);
+    const tools = generateCommonTools(async () => ({
+      aiAction,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+
+    const act = tools.find((t) => t.name === 'act')!;
+    await act.handler({ prompt: 'click the login button' });
+
+    expect(aiAction).toHaveBeenCalledWith('click the login button', {
+      deepThink: false,
+    });
+  });
+
+  it('forwards images to aiAction as a TUserPrompt-style object', async () => {
+    const aiAction = rs.fn().mockResolvedValue(undefined);
+    const tools = generateCommonTools(async () => ({
+      aiAction,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+
+    const act = tools.find((t) => t.name === 'act')!;
+    await act.handler({
+      prompt: 'tap the icon that matches the reference image',
+      image: 'https://example.com/icon.png',
+      imageName: 'target',
+    });
+
+    expect(aiAction).toHaveBeenCalledWith(
+      {
+        prompt: 'tap the icon that matches the reference image',
+        images: [{ name: 'target', url: 'https://example.com/icon.png' }],
+      },
+      { deepThink: false },
+    );
+  });
+
+  it('forwards a local-path url verbatim so core can resolve it', async () => {
+    const aiAction = rs.fn().mockResolvedValue(undefined);
+    const tools = generateCommonTools(async () => ({
+      aiAction,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+
+    const act = tools.find((t) => t.name === 'act')!;
+    await act.handler({
+      prompt: 'tap the icon that matches the supplied image',
+      image: './fixtures/icon.png',
+      imageName: 'icon',
+      convertHttpImage2Base64: true,
+    });
+
+    expect(aiAction).toHaveBeenCalledWith(
+      {
+        prompt: 'tap the icon that matches the supplied image',
+        images: [{ name: 'icon', url: './fixtures/icon.png' }],
+        convertHttpImage2Base64: true,
+      },
+      { deepThink: false },
+    );
+  });
+});
+
 describe('toolDefaults (deep locate / deep think)', () => {
   it('defaults locate.deepLocate to true for action tools when enabled', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(
       actionSpace,
       async () => ({
         callActionInActionSpace,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -631,13 +1067,13 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('keeps an explicit locate.deepLocate=false even when forced', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(
       actionSpace,
       async () => ({
         callActionInActionSpace,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -658,13 +1094,13 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('treats an explicit deepThink alias as deepLocate already set', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(
       actionSpace,
       async () => ({
         callActionInActionSpace,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -685,11 +1121,11 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('does not inject deepLocate for action tools when disabled', async () => {
-    const callActionInActionSpace = vi.fn().mockResolvedValue(undefined);
+    const callActionInActionSpace = rs.fn().mockResolvedValue(undefined);
     const [tool] = generateToolsFromActionSpace(actionSpace, async () => ({
       callActionInActionSpace,
-      getActionSpace: vi.fn().mockResolvedValue([]),
-      page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
     }));
 
     await tool.handler({ locate: 'the login button' });
@@ -700,12 +1136,12 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('passes deepLocate to the act tool when enabled', async () => {
-    const aiAction = vi.fn().mockResolvedValue('done');
+    const aiAction = rs.fn().mockResolvedValue('done');
     const commonTools = generateCommonTools(
       async () => ({
         aiAction,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -721,13 +1157,755 @@ describe('toolDefaults (deep locate / deep think)', () => {
     });
   });
 
+  it('emits human-readable aiAct verbose timeline while act is running', async () => {
+    let dumpListener:
+      | ((dump: string, executionDump?: unknown) => void)
+      | undefined;
+    let progressListener:
+      | ((event: Record<string, unknown>) => void)
+      | undefined;
+    const unsubscribe = rs.fn();
+    const reportFile = join(
+      process.cwd(),
+      'midscene_run/report/midscene-report.html',
+    );
+    let sequence = 1;
+    const emitProgress = (event: Record<string, unknown>) => {
+      const { event: phase, ...data } = event;
+      progressListener?.({
+        scope: 'aiAct',
+        phase,
+        sequence: sequence++,
+        data,
+      });
+    };
+    const progressScreenshot = (id: string) => ({
+      toSerializable: () => ({
+        type: 'midscene_screenshot_ref',
+        id,
+        storage: 'file',
+        path: `./screenshots/${id}.png`,
+      }),
+    });
+    const plan1 = {
+      taskId: 'plan-1',
+      type: 'Planning',
+      subType: 'Plan',
+      status: 'finished',
+      param: {
+        userInstruction: 'open settings',
+        replanningCycleLimit: 10,
+      },
+      uiContext: {
+        screenshot: {
+          toSerializable: () => ({
+            type: 'midscene_screenshot_ref',
+            id: 'shot-1',
+            storage: 'file',
+            path: './screenshots/shot-1.png',
+          }),
+        },
+      },
+      output: {
+        log: 'Need to open settings first.',
+        actions: [
+          {
+            type: 'Tap',
+            param: { locate: { prompt: 'Submit button' } },
+          },
+        ],
+        shouldContinuePlanning: true,
+      },
+      timing: { cost: 20 },
+    };
+    const locate1 = {
+      taskId: 'locate-1',
+      type: 'Planning',
+      subType: 'Locate',
+      status: 'finished',
+      param: { prompt: 'Submit button' },
+      output: {
+        element: {
+          description: 'Submit button',
+          center: [100, 200],
+          rect: { left: 80, top: 180, width: 40, height: 40 },
+        },
+      },
+      timing: { cost: 12 },
+    };
+    const tapRunning = {
+      taskId: 'tap-1',
+      type: 'Action Space',
+      subType: 'Tap',
+      status: 'running',
+      param: {
+        locate: {
+          description: 'Submit button',
+          center: [100, 200],
+          rect: { left: 80, top: 180, width: 40, height: 40 },
+        },
+      },
+    };
+    const tapStringPending = {
+      taskId: 'tap-string',
+      type: 'Action Space',
+      subType: 'Tap',
+      status: 'pending',
+      param: { locate: 'Submit button' },
+    };
+    const tapPending = {
+      taskId: 'tap-1',
+      type: 'Action Space',
+      subType: 'Tap',
+      status: 'pending',
+      param: {
+        locate: {
+          prompt: 'Submit button',
+          bbox: [8, 18, 12, 22],
+          locatedPixelBbox: [80, 180, 120, 220],
+        },
+      },
+    };
+    const tapFinished = {
+      ...tapRunning,
+      status: 'finished',
+      timing: { cost: 208 },
+    };
+    const plan2 = {
+      taskId: 'plan-2',
+      type: 'Planning',
+      subType: 'Plan',
+      status: 'finished',
+      param: {
+        userInstruction: 'open settings',
+        replanningCycleLimit: 10,
+      },
+      uiContext: {
+        screenshot: {
+          toSerializable: () => ({
+            type: 'midscene_screenshot_ref',
+            id: 'shot-2',
+            storage: 'file',
+            path: './screenshots/shot-2.png',
+          }),
+        },
+      },
+      output: {
+        log: 'The page is still transitioning, so wait briefly.',
+        actions: [
+          {
+            type: 'Sleep',
+            param: { timeMs: 2000 },
+          },
+        ],
+        shouldContinuePlanning: true,
+      },
+    };
+    const sleepRunning = {
+      taskId: 'sleep-1',
+      type: 'Action Space',
+      subType: 'Sleep',
+      status: 'running',
+      param: { timeMs: 2000 },
+    };
+    const sleepFinished = {
+      ...sleepRunning,
+      status: 'finished',
+      timing: { cost: 2004 },
+    };
+    const plan3 = {
+      taskId: 'plan-3',
+      type: 'Planning',
+      subType: 'Plan',
+      status: 'finished',
+      param: {
+        userInstruction: 'open settings',
+        replanningCycleLimit: 10,
+      },
+      uiContext: {
+        screenshot: {
+          toSerializable: () => ({
+            type: 'midscene_screenshot_ref',
+            id: 'shot-3',
+            storage: 'file',
+            path: './screenshots/shot-3.png',
+          }),
+        },
+      },
+      output: {
+        log: 'The selected page is open, so the requested task is complete.',
+        output: 'Settings opened.',
+        shouldContinuePlanning: false,
+      },
+    };
+    const emitDump = (tasks: unknown[]) => {
+      dumpListener?.('{}', {
+        id: 'execution-1',
+        name: 'Act - open settings',
+        description: 'open settings',
+        tasks,
+      });
+    };
+    const aiAction = rs.fn().mockImplementation(async () => {
+      emitProgress({
+        event: 'start',
+        prompt: 'open settings',
+        planLimit: 10,
+      });
+      emitProgress({
+        event: 'plan_thinking',
+        planIndex: 1,
+        planLimit: 10,
+        screenshot: progressScreenshot('shot-1'),
+      });
+      emitProgress({
+        event: 'plan_planned',
+        planIndex: 1,
+        planLimit: 10,
+        log: 'Need to open settings first.',
+      });
+      emitProgress({
+        event: 'plan_action',
+        planIndex: 1,
+        planLimit: 10,
+        action: {
+          name: 'Tap',
+          target: 'Submit button',
+          point: [100, 200],
+          bbox: [80, 180, 120, 220],
+        },
+      });
+      emitProgress({
+        event: 'action_running',
+        planIndex: 1,
+        planLimit: 10,
+        action: { name: 'Tap', point: [100, 200] },
+      });
+      emitProgress({
+        event: 'action_done',
+        planIndex: 1,
+        planLimit: 10,
+        action: { name: 'Tap' },
+        durationMs: 208,
+      });
+      emitProgress({
+        event: 'plan_thinking',
+        planIndex: 2,
+        planLimit: 10,
+        screenshot: progressScreenshot('shot-2'),
+      });
+      emitProgress({
+        event: 'plan_planned',
+        planIndex: 2,
+        planLimit: 10,
+        log: 'The page is still transitioning, so wait briefly.',
+      });
+      emitProgress({
+        event: 'plan_action',
+        planIndex: 2,
+        planLimit: 10,
+        action: { name: 'Sleep', param: { timeMs: 2000 } },
+      });
+      emitProgress({
+        event: 'action_running',
+        planIndex: 2,
+        planLimit: 10,
+        action: { name: 'Sleep', param: { timeMs: 2000 } },
+      });
+      emitProgress({
+        event: 'action_done',
+        planIndex: 2,
+        planLimit: 10,
+        action: { name: 'Sleep' },
+        durationMs: 2004,
+      });
+      emitProgress({
+        event: 'plan_thinking',
+        planIndex: 3,
+        planLimit: 10,
+        screenshot: progressScreenshot('shot-3'),
+      });
+      emitProgress({
+        event: 'plan_planned',
+        planIndex: 3,
+        planLimit: 10,
+        log: 'The selected page is open, so the requested task is complete.',
+      });
+      emitProgress({
+        event: 'complete',
+        planIndex: 3,
+        planLimit: 10,
+        output: 'Settings opened.',
+      });
+      emitDump([plan1, tapStringPending]);
+      emitDump([plan1, tapPending]);
+      emitDump([plan1, locate1, tapRunning]);
+      emitDump([plan1, locate1, tapFinished]);
+      emitDump([plan1, locate1, tapFinished, plan2, sleepRunning]);
+      emitDump([plan1, locate1, tapFinished, plan2, sleepFinished]);
+      emitDump([plan1, locate1, tapFinished, plan2, sleepFinished, plan3]);
+      return 'Settings opened.';
+    });
+    const addDumpUpdateListener = rs.fn((listener) => {
+      dumpListener = listener;
+      return unsubscribe;
+    });
+    const addProgressListener = rs.fn((listener) => {
+      progressListener = listener;
+      return unsubscribe;
+    });
+    const commonTools = generateCommonTools(async () => ({
+      aiAction,
+      addProgressListener,
+      addDumpUpdateListener,
+      reportFile,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+    const actTool = commonTools.find((tool) => tool.name === 'act');
+    const consoleSpy = rs.spyOn(console, 'log').mockImplementation(() => {});
+
+    await withCliVerboseContext(
+      {
+        enabled: true,
+        scriptName: 'midscene-web',
+        commandName: 'act',
+      },
+      async () => {
+        await actTool?.handler({ prompt: 'open settings' });
+      },
+    );
+
+    const messages = consoleSpy.mock.calls.flatMap(([message]) =>
+      String(message).split('\n'),
+    );
+    expect(messages).toContain('[Midscene][aiAct] Start: open settings');
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 1/10] Thinking with the latest screenshot: midscene_run/report/screenshots/shot-1.png',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 1/10] Planned: Need to open settings first.',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 1/10] Action: Tap "Submit button" at (100, 200), bbox=(80,180,120,220)',
+    );
+    expect(messages).not.toContain(
+      '[Midscene][aiAct][Plan 1/10] Action: Tap: {"locate":"Submit button"}',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Action] Running: Tap at (100, 200)',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Action] Done: Tap cost=208ms',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 2/10] Thinking with the latest screenshot: midscene_run/report/screenshots/shot-2.png',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 2/10] Planned: The page is still transitioning, so wait briefly.',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 2/10] Action: Sleep 2000ms',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Action] Running: Sleep 2000ms',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Action] Done: Sleep cost=2004ms',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 3/10] Thinking with the latest screenshot: midscene_run/report/screenshots/shot-3.png',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 3/10] Planned: The selected page is open, so the requested task is complete.',
+    );
+    expect(messages).toContain('[Midscene][aiAct] Complete: Settings opened.');
+    expect(
+      messages.filter((message) =>
+        message.includes('[Midscene][aiAct][Plan 1/10] Action: Tap'),
+      ),
+    ).toHaveLength(1);
+    expect(addProgressListener).toHaveBeenCalledOnce();
+    expect(addDumpUpdateListener).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    consoleSpy.mockRestore();
+  });
+
+  it('does not render aiAct dump progress without core progress listener', async () => {
+    const unsubscribe = rs.fn();
+    const aiAction = rs.fn().mockResolvedValue('Settings opened.');
+    const addDumpUpdateListener = rs.fn(() => unsubscribe);
+    const commonTools = generateCommonTools(async () => ({
+      aiAction,
+      addDumpUpdateListener,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+    const actTool = commonTools.find((tool) => tool.name === 'act');
+    const consoleSpy = rs.spyOn(console, 'log').mockImplementation(() => {});
+
+    await withCliVerboseContext(
+      {
+        enabled: true,
+        scriptName: 'midscene-web',
+        commandName: 'act',
+      },
+      async () => {
+        await actTool?.handler({ prompt: 'open settings' });
+      },
+    );
+
+    const messages = consoleSpy.mock.calls.flatMap(([message]) =>
+      String(message).split('\n'),
+    );
+    expect(
+      messages.some((message) => message.startsWith('[Midscene][aiAct]')),
+    ).toBe(false);
+    expect(addDumpUpdateListener).not.toHaveBeenCalled();
+    expect(unsubscribe).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+
+  it('emits human-readable aiAct planning failure details', async () => {
+    let dumpListener:
+      | ((dump: string, executionDump?: unknown) => void)
+      | undefined;
+    let progressListener:
+      | ((event: Record<string, unknown>) => void)
+      | undefined;
+    const unsubscribe = rs.fn();
+    const reportFile = join(
+      process.cwd(),
+      'midscene_run/report/midscene-report.html',
+    );
+    let sequence = 1;
+    const emitProgress = (event: Record<string, unknown>) => {
+      const { event: phase, ...data } = event;
+      progressListener?.({
+        scope: 'aiAct',
+        phase,
+        sequence: sequence++,
+        data,
+      });
+    };
+    const aiAction = rs.fn().mockImplementation(async () => {
+      emitProgress({
+        event: 'start',
+        prompt: 'open settings',
+        planLimit: 3,
+      });
+      emitProgress({
+        event: 'plan_thinking',
+        planIndex: 1,
+        planLimit: 3,
+        screenshot: {
+          toSerializable: () => ({
+            type: 'midscene_screenshot_ref',
+            id: 'failed-shot',
+            storage: 'file',
+            path: './screenshots/failed-shot.png',
+          }),
+        },
+      });
+      emitProgress({
+        event: 'plan_failed',
+        planIndex: 1,
+        planLimit: 3,
+        message: 'Task failed: The settings entry is not visible.',
+        error: 'Task failed: The settings entry is not visible.',
+      });
+      dumpListener?.('{}', {
+        id: 'execution-1',
+        name: 'Act - open settings',
+        description: 'open settings',
+        tasks: [
+          {
+            taskId: 'plan-failed',
+            type: 'Planning',
+            subType: 'Plan',
+            status: 'failed',
+            param: {
+              userInstruction: 'open settings',
+              replanningCycleLimit: 3,
+            },
+            uiContext: {
+              screenshot: {
+                toSerializable: () => ({
+                  type: 'midscene_screenshot_ref',
+                  id: 'failed-shot',
+                  storage: 'file',
+                  path: './screenshots/failed-shot.png',
+                }),
+              },
+            },
+            output: {
+              log: 'The settings entry is not visible.',
+              shouldContinuePlanning: false,
+            },
+            errorMessage: 'Task failed: The settings entry is not visible.',
+          },
+        ],
+      });
+      throw new Error('Task failed: The settings entry is not visible.');
+    });
+    const addDumpUpdateListener = rs.fn((listener) => {
+      dumpListener = listener;
+      return unsubscribe;
+    });
+    const addProgressListener = rs.fn((listener) => {
+      progressListener = listener;
+      return unsubscribe;
+    });
+    const commonTools = generateCommonTools(async () => ({
+      aiAction,
+      addProgressListener,
+      addDumpUpdateListener,
+      reportFile,
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+    const actTool = commonTools.find((tool) => tool.name === 'act');
+    const consoleSpy = rs.spyOn(console, 'log').mockImplementation(() => {});
+    const consoleErrorSpy = rs
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+
+    const result = await withCliVerboseContext(
+      {
+        enabled: true,
+        scriptName: 'midscene-web',
+        commandName: 'act',
+      },
+      async () => actTool?.handler({ prompt: 'open settings' }),
+    );
+
+    const messages = consoleSpy.mock.calls.flatMap(([message]) =>
+      String(message).split('\n'),
+    );
+    expect(result?.isError).toBe(true);
+    expect(messages).toContain('[Midscene][aiAct] Start: open settings');
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 1/3] Thinking with the latest screenshot: midscene_run/report/screenshots/failed-shot.png',
+    );
+    expect(messages).toContain(
+      '[Midscene][aiAct][Plan 1/3] Failed: Task failed: The settings entry is not visible.',
+    );
+    expect(messages).not.toContain(
+      '[Midscene][aiAct] Complete: The settings entry is not visible.',
+    );
+    expect(addProgressListener).toHaveBeenCalledOnce();
+    expect(addDumpUpdateListener).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    consoleSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('exports inline verbose dump screenshots to readable file paths', async () => {
+    let dumpListener:
+      | ((dump: string, executionDump?: unknown) => void)
+      | undefined;
+    let progressListener:
+      | ((event: Record<string, unknown>) => void)
+      | undefined;
+    const unsubscribe = rs.fn();
+    const inlineScreenshot = {
+      extension: 'png',
+      rawBase64: 'Zm9v',
+      toSerializable: () => ({
+        type: 'midscene_screenshot_ref',
+        id: 'inline-shot-1',
+        capturedAt: 1000,
+        mimeType: 'image/png',
+        storage: 'inline',
+      }),
+    };
+    const aiAction = rs.fn().mockImplementation(async () => {
+      progressListener?.({
+        scope: 'aiAct',
+        sequence: 1,
+        phase: 'plan_thinking',
+        data: {
+          planIndex: 1,
+          screenshot: inlineScreenshot,
+        },
+      });
+      dumpListener?.('{}', {
+        id: 'execution-1',
+        name: 'Act - open settings',
+        tasks: [
+          {
+            taskId: 'plan-1',
+            type: 'Planning',
+            subType: 'Plan',
+            status: 'running',
+            param: { userInstruction: 'open settings' },
+            uiContext: {
+              screenshot: inlineScreenshot,
+            },
+            recorder: [
+              {
+                timing: 'after-calling',
+                screenshot: inlineScreenshot,
+              },
+            ],
+          },
+        ],
+      });
+      return 'done';
+    });
+    const addDumpUpdateListener = rs.fn((listener) => {
+      dumpListener = listener;
+      return unsubscribe;
+    });
+    const addProgressListener = rs.fn((listener) => {
+      progressListener = listener;
+      return unsubscribe;
+    });
+    const commonTools = generateCommonTools(async () => ({
+      aiAction,
+      addProgressListener,
+      addDumpUpdateListener,
+      reportFile: '/tmp/midscene-report.html',
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+    const actTool = commonTools.find((tool) => tool.name === 'act');
+    const consoleSpy = rs.spyOn(console, 'log').mockImplementation(() => {});
+
+    await withCliVerboseContext(
+      {
+        enabled: true,
+        scriptName: 'midscene-web',
+        commandName: 'act',
+      },
+      async () => {
+        await actTool?.handler({ prompt: 'open settings' });
+      },
+    );
+
+    const messages = consoleSpy.mock.calls.flatMap(([message]) =>
+      String(message).split('\n'),
+    );
+    const screenshotMessage = messages.find((message) =>
+      message.includes(
+        '[Midscene][aiAct][Plan 1] Thinking with the latest screenshot: ',
+      ),
+    );
+    expect(screenshotMessage).toMatch(
+      /^\[Midscene\]\[aiAct\]\[Plan 1\] Thinking with the latest screenshot: .+screenshots\/inline-shot-1\.png$/,
+    );
+    const screenshotPath = screenshotMessage?.replace(
+      '[Midscene][aiAct][Plan 1] Thinking with the latest screenshot: ',
+      '',
+    );
+    expect(screenshotPath).toBeDefined();
+    expect(existsSync(screenshotPath!)).toBe(true);
+    expect(readFileSync(screenshotPath!, 'utf8')).toBe('foo');
+    expect(addProgressListener).toHaveBeenCalledOnce();
+    expect(addDumpUpdateListener).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    consoleSpy.mockRestore();
+  });
+
+  it('emits jsonl aiAct progress events while act is running', async () => {
+    let progressListener:
+      | ((event: Record<string, unknown>) => void)
+      | undefined;
+    const unsubscribe = rs.fn();
+    const aiAction = rs.fn().mockImplementation(async () => {
+      progressListener?.({
+        scope: 'aiAct',
+        sequence: 1,
+        phase: 'plan_thinking',
+        data: {
+          planIndex: 1,
+          planLimit: 3,
+          screenshot: {
+            toSerializable: () => ({
+              type: 'midscene_screenshot_ref',
+              id: 'shot-1',
+              storage: 'file',
+              path: './screenshots/shot-1.png',
+            }),
+          },
+        },
+      });
+      return 'done';
+    });
+    const addDumpUpdateListener = rs.fn(() => unsubscribe);
+    const addProgressListener = rs.fn((listener) => {
+      progressListener = listener;
+      return unsubscribe;
+    });
+    const commonTools = generateCommonTools(async () => ({
+      aiAction,
+      addProgressListener,
+      addDumpUpdateListener,
+      reportFile: '/tmp/midscene-report.html',
+      getActionSpace: rs.fn().mockResolvedValue([]),
+      page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
+    }));
+    const actTool = commonTools.find((tool) => tool.name === 'act');
+    const consoleSpy = rs.spyOn(console, 'log').mockImplementation(() => {});
+
+    await withCliVerboseContext(
+      {
+        enabled: true,
+        format: 'jsonl',
+        scriptName: 'midscene-web',
+        commandName: 'act',
+      },
+      async () => {
+        await actTool?.handler({ prompt: 'open settings' });
+      },
+    );
+
+    const progressEvents = consoleSpy.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => message.includes('"type":"midscene_progress"'))
+      .map((message) => JSON.parse(message));
+    expect(progressEvents).toContainEqual(
+      expect.objectContaining({
+        event: 'agent_ready',
+        scriptName: 'midscene-web',
+        command: 'act',
+        tool: 'act',
+      }),
+    );
+    expect(progressEvents).toContainEqual(
+      expect.objectContaining({
+        event: 'agent_progress',
+        command: 'act',
+        tool: 'act',
+        scope: 'aiAct',
+        progress: expect.objectContaining({
+          phase: 'plan_thinking',
+          sequence: 1,
+          planIndex: 1,
+          planLimit: 3,
+          screenshots: [
+            expect.objectContaining({
+              id: 'shot-1',
+              storage: 'file',
+              path: './screenshots/shot-1.png',
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(addProgressListener).toHaveBeenCalledOnce();
+    expect(addDumpUpdateListener).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    consoleSpy.mockRestore();
+  });
+
   it('lets an explicit act deepLocate arg override the server default', async () => {
-    const aiAction = vi.fn().mockResolvedValue('done');
+    const aiAction = rs.fn().mockResolvedValue('done');
     const commonTools = generateCommonTools(
       async () => ({
         aiAction,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -744,12 +1922,12 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('plans the act tool with deepThink when enabled', async () => {
-    const aiAction = vi.fn().mockResolvedValue('done');
+    const aiAction = rs.fn().mockResolvedValue('done');
     const commonTools = generateCommonTools(
       async () => ({
         aiAction,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -765,12 +1943,12 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('lets an explicit act deepThink arg override the server default', async () => {
-    const aiAction = vi.fn().mockResolvedValue('done');
+    const aiAction = rs.fn().mockResolvedValue('done');
     const commonTools = generateCommonTools(
       async () => ({
         aiAction,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,
@@ -786,12 +1964,12 @@ describe('toolDefaults (deep locate / deep think)', () => {
   });
 
   it('applies both locate and act defaults together', async () => {
-    const aiAction = vi.fn().mockResolvedValue('done');
+    const aiAction = rs.fn().mockResolvedValue('done');
     const commonTools = generateCommonTools(
       async () => ({
         aiAction,
-        getActionSpace: vi.fn().mockResolvedValue([]),
-        page: { screenshotBase64: vi.fn().mockResolvedValue(screenshotBase64) },
+        getActionSpace: rs.fn().mockResolvedValue([]),
+        page: { screenshotBase64: rs.fn().mockResolvedValue(screenshotBase64) },
       }),
       undefined,
       undefined,

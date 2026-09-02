@@ -5,7 +5,8 @@ import type {
 } from '@midscene/core';
 import { ReportActionDump, runConnectivityTest } from '@midscene/core';
 import {
-  globalModelConfigManager,
+  ModelConfigManager,
+  type TModelConfig,
   overrideAIConfig,
 } from '@midscene/shared/env';
 import { uuid } from '@midscene/shared/utils';
@@ -72,7 +73,7 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
   formatErrorMessage(error: any): string {
     const errorMessage = error?.message || '';
     if (errorMessage.includes('of different extension')) {
-      return 'Conflicting extension detected. Please disable the suspicious plugins and refresh the page. Guide: https://midscenejs.com/quick-experience.html#faq';
+      return 'Conflicting extension detected. Please disable the suspicious plugins and refresh the page. Guide: https://midscenejs.com/quick-start.html#chrome-extension-faq';
     }
     return this.formatBasicErrorMessage(error);
   }
@@ -133,11 +134,14 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
     console.log('Config updated. Agent will be recreated on next execution.');
   }
 
-  async runConnectivityTest(): Promise<ConnectivityTestResult> {
+  async runConnectivityTest(
+    aiConfig: TModelConfig,
+  ): Promise<ConnectivityTestResult> {
+    const modelConfigManager = new ModelConfigManager(aiConfig);
     return runConnectivityTest({
-      defaultModelConfig: globalModelConfigManager.getModelConfig('default'),
-      planningModelConfig: globalModelConfigManager.getModelConfig('planning'),
-      insightModelConfig: globalModelConfigManager.getModelConfig('insight'),
+      defaultModelConfig: modelConfigManager.getModelConfig('default'),
+      planningModelConfig: modelConfigManager.getModelConfig('planning'),
+      insightModelConfig: modelConfigManager.getModelConfig('insight'),
     });
   }
 
@@ -257,7 +261,7 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
           if (dumpString) {
             const groupedDump =
               ReportActionDump.fromSerializedString(dumpString);
-            response.dump = groupedDump.executions?.[0] || null;
+            response.dump = groupedDump;
           }
         }
       } catch (error: unknown) {
@@ -319,7 +323,7 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
   async cancelTask(_requestId: string): Promise<{
     error?: string;
     success?: boolean;
-    dump?: ExecutionDump | null;
+    dump?: ExecutionDump | ReportActionDump | null;
     reportHTML?: string | null;
   }> {
     if (!this.agent) {
@@ -327,7 +331,7 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
     }
 
     // Get execution data BEFORE destroying the agent
-    let dump: ExecutionDump | null = null;
+    let dump: ExecutionDump | ReportActionDump | null = null;
     let reportHTML: string | null = null;
 
     // Get dump data separately - don't let reportHTML errors affect dump retrieval
@@ -336,10 +340,8 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
       if (typeof this.agent.dumpDataString === 'function') {
         const dumpString = this.agent.dumpDataString();
         if (dumpString) {
-          // dumpDataString() returns ReportActionDump: { executions: ExecutionDump[] }
-          // In Playground, each "Run" creates one execution, so we take executions[0]
           const groupedDump = ReportActionDump.fromSerializedString(dumpString);
-          dump = groupedDump.executions?.[0] ?? null;
+          dump = groupedDump;
         }
       }
     } catch (error) {
@@ -349,22 +351,16 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
       );
     }
 
-    // Try to get reportHTML separately - this may fail in browser environment
-    // where fs.readFileSync is not available
+    // Try to get reportHTML separately so failures do not affect dump retrieval.
     try {
       if (typeof this.agent.reportHTMLString === 'function') {
         const html = this.agent.reportHTMLString();
-        if (
-          html &&
-          typeof html === 'string' &&
-          !html.includes('REPLACE_ME_WITH_REPORT_HTML')
-        ) {
+        if (html && typeof html === 'string') {
           reportHTML = html;
         }
       }
     } catch (error) {
-      // reportHTMLString may throw in browser environment (fs not available)
-      // This is expected, just continue with dump data only
+      // Report generation is best-effort here; continue with dump data only.
       console.warn(
         '[LocalExecutionAdapter] reportHTMLString not available in this environment',
       );
@@ -389,11 +385,11 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
    * This allows retrieving dump and report when execution is stopped
    */
   async getCurrentExecutionData(): Promise<{
-    dump: ExecutionDump | null;
+    dump: ExecutionDump | ReportActionDump | null;
     reportHTML: string | null;
   }> {
     const response = {
-      dump: null as ExecutionDump | null,
+      dump: null as ExecutionDump | ReportActionDump | null,
       reportHTML: null as string | null,
     };
 
@@ -403,7 +399,7 @@ export class LocalExecutionAdapter extends BasePlaygroundAdapter {
         const dumpString = this.agent.dumpDataString();
         if (dumpString) {
           const groupedDump = ReportActionDump.fromSerializedString(dumpString);
-          response.dump = groupedDump.executions?.[0] || null;
+          response.dump = groupedDump;
         }
       }
 

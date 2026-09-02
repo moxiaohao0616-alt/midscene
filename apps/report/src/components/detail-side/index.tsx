@@ -2,7 +2,12 @@
 'use client';
 import './index.less';
 
-import { FileImageOutlined, RadiusSettingOutlined } from '@ant-design/icons';
+import {
+  DownOutlined,
+  FileImageOutlined,
+  RadiusSettingOutlined,
+  RightOutlined,
+} from '@ant-design/icons';
 import type {
   ExecutionTaskAction,
   ExecutionTaskInsightAssertion,
@@ -17,9 +22,8 @@ import {
   timeCostStrElement,
 } from '@midscene/visualizer';
 import { Tag, Tooltip } from 'antd';
+import { useState } from 'react';
 import { isElementField, useExecutionDump } from '../store';
-
-const noop = () => {};
 
 function isPlainObject(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -30,19 +34,10 @@ const Card = (props: {
   title?: string;
   subtitle?: string;
   characteristic?: string;
-  onMouseEnter?: () => void;
-  onMouseLeave?: () => void;
   content: any;
 }) => {
-  const {
-    highlightWithColor,
-    title,
-    subtitle,
-    onMouseEnter,
-    onMouseLeave,
-    content,
-    characteristic,
-  } = props;
+  const { highlightWithColor, title, subtitle, content, characteristic } =
+    props;
   const titleTag = props.characteristic ? (
     <div className="item-extra">
       <div className="title-tag">
@@ -70,8 +65,6 @@ const Card = (props: {
     <div
       className={`item ${modeClass} ${highlightWithColor ? 'item-highlight' : ''}`}
       style={{ ...highlightStyle }}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
     >
       {/* {extraSection} */}
 
@@ -94,6 +87,35 @@ const Card = (props: {
       >
         {content}
       </div>
+    </div>
+  );
+};
+
+// Collapsible card component for reasoning content (collapsed by default)
+const CollapsibleCard = (props: {
+  title: string;
+  content: any;
+  defaultCollapsed?: boolean;
+}) => {
+  const { title, content, defaultCollapsed = true } = props;
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+
+  return (
+    <div className="item item-lite item-collapsible">
+      <div
+        className="title title-collapsible"
+        onClick={() => setCollapsed(!collapsed)}
+      >
+        {title}
+        <span className="collapse-icon">
+          {collapsed ? <RightOutlined /> : <DownOutlined />}
+        </span>
+      </div>
+      {!collapsed && (
+        <div className="description">
+          <pre className="description-content">{content}</pre>
+        </div>
+      )}
     </div>
   );
 };
@@ -412,7 +434,9 @@ const DetailSide = (): JSX.Element => {
         ? [
             {
               key: 'act context',
-              content: aiActContextValue,
+              content: (
+                <pre className="act-context-source">{aiActContextValue}</pre>
+              ),
             },
           ]
         : []),
@@ -485,6 +509,10 @@ const DetailSide = (): JSX.Element => {
     // Get subGoalStatus and memoriesStatus from param
     const subGoalStatus = (planningTask.param as any)?.subGoalStatus;
     const memoriesStatus = (planningTask.param as any)?.memoriesStatus;
+    const locateContext =
+      planningTask.subType === 'Locate'
+        ? (planningTask.param as any)?.context
+        : undefined;
 
     if (planningTask.param?.userInstruction) {
       const instructionContent =
@@ -518,7 +546,7 @@ const DetailSide = (): JSX.Element => {
           ...(isPageContextFrozen
             ? [
                 {
-                  key: 'context',
+                  key: 'UI Context',
                   content: <Tag color="blue">Frozen Context 🧊</Tag>,
                 },
               ]
@@ -540,6 +568,16 @@ const DetailSide = (): JSX.Element => {
             content: promptContent,
             images: images,
           },
+          ...(locateContext
+            ? [
+                {
+                  key: 'context',
+                  content: (
+                    <pre className="act-context-source">{locateContext}</pre>
+                  ),
+                },
+              ]
+            : []),
           ...(memoriesStatus
             ? [
                 {
@@ -559,7 +597,7 @@ const DetailSide = (): JSX.Element => {
           ...(isPageContextFrozen
             ? [
                 {
-                  key: 'context',
+                  key: 'UI Context',
                   content: <Tag color="blue">Frozen Context 🧊</Tag>,
                 },
               ]
@@ -596,10 +634,20 @@ const DetailSide = (): JSX.Element => {
               },
             ]
           : []),
-        ...(isPageContextFrozen
+        ...(taskParam?.context
           ? [
               {
                 key: 'context',
+                content: (
+                  <pre className="act-context-source">{taskParam.context}</pre>
+                ),
+              },
+            ]
+          : []),
+        ...(isPageContextFrozen
+          ? [
+              {
+                key: 'UI Context',
                 content: <Tag color="blue">Frozen Context 🧊</Tag>,
               },
             ]
@@ -658,14 +706,7 @@ const DetailSide = (): JSX.Element => {
     if (task.errorMessage) {
       errorText = task.errorMessage;
     } else if (task.error) {
-      // if no errorMessage, try to show error object
-      if (typeof task.error === 'string') {
-        errorText = task.error;
-      } else if (typeof task.error === 'object' && task.error.message) {
-        errorText = task.error.message;
-      } else {
-        errorText = JSON.stringify(task.error, null, 2) || 'Unknown error';
-      }
+      errorText = task.error.message;
     }
 
     // add stack info (if exists and not duplicate)
@@ -677,8 +718,6 @@ const DetailSide = (): JSX.Element => {
       <Card
         liteMode={true}
         title="error"
-        onMouseEnter={noop}
-        onMouseLeave={noop}
         content={
           <pre className="description-content" style={{ color: '#F00' }}>
             {errorText}
@@ -741,8 +780,6 @@ const DetailSide = (): JSX.Element => {
           <Card
             liteMode={true}
             title="thought"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={<pre className="description-content">{thought}</pre>}
           />
         )}
@@ -750,8 +787,6 @@ const DetailSide = (): JSX.Element => {
         <Card
           liteMode={true}
           title="assertion result"
-          onMouseEnter={noop}
-          onMouseLeave={noop}
           content={
             <pre className="description-content">
               {JSON.stringify(output, undefined, 2)}
@@ -759,15 +794,7 @@ const DetailSide = (): JSX.Element => {
           }
         />
         {reasoningContent && (
-          <Card
-            liteMode={true}
-            title="reasoning"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
-            content={
-              <pre className="description-content">{reasoningContent}</pre>
-            }
-          />
+          <CollapsibleCard title="reasoning" content={reasoningContent} />
         )}
       </>
     );
@@ -777,8 +804,6 @@ const DetailSide = (): JSX.Element => {
         <Card
           liteMode={true}
           title=""
-          onMouseEnter={noop}
-          onMouseLeave={noop}
           content={
             <pre className="description-content yaml-content">
               {(task as ExecutionTaskPlanning).output?.yamlString}
@@ -796,8 +821,6 @@ const DetailSide = (): JSX.Element => {
             key="thought"
             liteMode={true}
             title="thought"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={
               <pre className="description-content">
                 {(task as ExecutionTaskPlanning).output?.thought || ''}
@@ -814,8 +837,6 @@ const DetailSide = (): JSX.Element => {
             key="memory"
             liteMode={true}
             title="memory"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={
               <pre className="description-content">
                 {(task as ExecutionTaskPlanning).output?.memory}
@@ -840,8 +861,6 @@ const DetailSide = (): JSX.Element => {
             key="sub-goals"
             liteMode={true}
             title="sub-goals"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={
               <pre className="description-content">{subGoalsContent}</pre>
             }
@@ -858,8 +877,6 @@ const DetailSide = (): JSX.Element => {
             key="mark-finished"
             liteMode={true}
             title="marked finished"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={
               <pre className="description-content">
                 Sub-goal indexes: {markFinishedIndexes.join(', ')}
@@ -928,8 +945,6 @@ const DetailSide = (): JSX.Element => {
                 liteMode={true}
                 title={`${actionType}.${key}`}
                 subtitle={action.thought}
-                onMouseEnter={noop}
-                onMouseLeave={noop}
                 content={content}
               />,
             );
@@ -951,8 +966,6 @@ const DetailSide = (): JSX.Element => {
               liteMode={true}
               title={typeStr(action as any)}
               subtitle={action.thought}
-              onMouseEnter={noop}
-              onMouseLeave={noop}
               content={nonObjectContent}
             />,
           );
@@ -967,8 +980,6 @@ const DetailSide = (): JSX.Element => {
             key="output-message"
             liteMode={true}
             title="output"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={<pre className="description-content">{outputMessage}</pre>}
           />,
         );
@@ -984,8 +995,6 @@ const DetailSide = (): JSX.Element => {
             key="more-actions"
             liteMode={true}
             title="should continue planning"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={
               <pre className="description-content">
                 {(task as ExecutionTaskPlanning).output?.shouldContinuePlanning
@@ -1000,15 +1009,10 @@ const DetailSide = (): JSX.Element => {
       // Add reasoning at the end
       if (reasoningContent) {
         planItems.push(
-          <Card
+          <CollapsibleCard
             key="reasoning"
-            liteMode={true}
             title="reasoning"
-            onMouseEnter={noop}
-            onMouseLeave={noop}
-            content={
-              <pre className="description-content">{reasoningContent}</pre>
-            }
+            content={reasoningContent}
           />,
         );
       }
@@ -1035,8 +1039,6 @@ const DetailSide = (): JSX.Element => {
           <Card
             key="thought"
             liteMode={true}
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             content={<pre>{thought}</pre>}
             title="thought"
           />,
@@ -1075,14 +1077,7 @@ const DetailSide = (): JSX.Element => {
           }
 
           outputItems.push(
-            <Card
-              key={key}
-              liteMode={true}
-              onMouseEnter={noop}
-              onMouseLeave={noop}
-              title={key}
-              content={content}
-            />,
+            <Card key={key} liteMode={true} title={key} content={content} />,
           );
         });
       } else {
@@ -1091,8 +1086,6 @@ const DetailSide = (): JSX.Element => {
           <Card
             key="output"
             liteMode={true}
-            onMouseEnter={noop}
-            onMouseLeave={noop}
             title="output"
             content={
               <pre className="description-content">
@@ -1106,13 +1099,10 @@ const DetailSide = (): JSX.Element => {
       // Add reasoning at the end
       if (reasoningContent) {
         outputItems.push(
-          <Card
+          <CollapsibleCard
             key="reasoning"
-            liteMode={true}
-            onMouseEnter={noop}
-            onMouseLeave={noop}
-            content={<pre>{reasoningContent}</pre>}
             title="reasoning"
+            content={reasoningContent}
           />,
         );
       }

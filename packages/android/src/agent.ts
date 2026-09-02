@@ -116,14 +116,9 @@ export class AndroidAgent extends PageAgent<AndroidDevice> {
    * @param opt - Optional ADB shell execution settings
    */
   async runAdbShell(command: string, opt?: RunAdbShellOpt): Promise<string> {
-    if (opt?.timeout !== undefined) {
-      const adb = await this.interface.getAdb();
-      return await adb.shell(command, { timeout: opt.timeout });
-    }
-
     const action =
       this.wrapActionInActionSpace<DeviceActionRunAdbShell>('RunAdbShell');
-    return action({ command });
+    return action({ command, ...opt });
   }
 
   private createActionWrapper<T extends DeviceAction>(
@@ -140,7 +135,7 @@ export async function agentFromAdbDevice(
   opts?: AndroidAgentOpt & AndroidDeviceOpt,
 ) {
   if (!deviceId) {
-    const devices = await getConnectedDevices();
+    const devices = await getConnectedDevices(opts);
 
     if (devices.length === 0) {
       throw new Error(

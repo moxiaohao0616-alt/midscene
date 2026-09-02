@@ -1,53 +1,67 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, rs } from '@rstest/core';
 import ScrcpyServer, {
+  appendBoundedScrcpyOutput,
   resolveRequestedDeviceId,
 } from '../../src/scrcpy-server';
 
 const {
-  mockPushServer,
+  mockExecFile,
   mockStart,
-  mockReadableFrom,
-  mockCreateReadStream,
   mockOptionsCtor,
-} = vi.hoisted(() => ({
-  mockPushServer: vi.fn(),
-  mockStart: vi.fn(),
-  mockReadableFrom: vi.fn(),
-  mockCreateReadStream: vi.fn(),
-  mockOptionsCtor: vi.fn((options) => options),
+  mockResolveExternalResourcePath,
+} = rs.hoisted(() => ({
+  mockExecFile: rs.fn(
+    (
+      _file: string,
+      _args: string[],
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      callback(null, '', '');
+    },
+  ),
+  mockStart: rs.fn(),
+  mockOptionsCtor: rs.fn((options) => options),
+  mockResolveExternalResourcePath: rs.fn(
+    (_resourcePath: string) => '/unpacked/scrcpy-server',
+  ),
 }));
 
-vi.mock('@yume-chan/adb-scrcpy', () => ({
+rs.mock('node:child_process', () => ({ execFile: mockExecFile }));
+
+rs.mock('@midscene/android', () => ({
+  resolveExternalResourcePath: mockResolveExternalResourcePath,
+}));
+
+rs.mock('@yume-chan/adb-scrcpy', () => ({
   AdbScrcpyClient: {
-    pushServer: mockPushServer,
     start: mockStart,
   },
   AdbScrcpyOptions3_3_3: mockOptionsCtor,
 }));
 
-vi.mock('@yume-chan/stream-extra', () => ({
-  ReadableStream: {
-    from: mockReadableFrom,
-  },
-}));
-
-vi.mock('@yume-chan/scrcpy', () => ({
+rs.mock('@yume-chan/scrcpy', () => ({
   DefaultServerPath: '/mocked/scrcpy-server.jar',
 }));
 
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>();
-  return {
-    ...actual,
-    createReadStream: mockCreateReadStream,
-  };
-});
-
 describe('ScrcpyServer', () => {
+  it('allows short event-loop stalls without dropping the preview heartbeat', () => {
+    const server = new ScrcpyServer();
+    expect((server as any).io.engine.opts.pingInterval).toBe(25_000);
+    expect((server as any).io.engine.opts.pingTimeout).toBe(60_000);
+  });
+
+  it('keeps only the most recent scrcpy output lines', () => {
+    const lines: string[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      appendBoundedScrcpyOutput(lines, `line-${index}`, 3);
+    }
+    expect(lines).toEqual(['line-2', 'line-3', 'line-4']);
+  });
+
   it('prefers the explicit device from the preview handshake', () => {
     expect(
       resolveRequestedDeviceId(
-        { deviceId: 'SERIAL123', maxSize: 1024 },
+        { deviceId: 'SERIAL123', maxSize: 0, videoBitRate: 8_000_000 },
         'OLD_DEVICE',
       ),
     ).toBe('SERIAL123');
@@ -58,24 +72,40 @@ describe('ScrcpyServer', () => {
   });
 
   it('enables frame metadata for the scrcpy web preview stream', async () => {
-    mockCreateReadStream.mockReturnValue({ stream: true });
-    mockReadableFrom.mockReturnValue({ readable: true });
     mockStart.mockResolvedValue({ videoStream: Promise.resolve(null) });
 
     const server = new ScrcpyServer();
+    server.currentDeviceId = 'another-device';
     const adb = { serial: 'device-1' };
-    const onProgress = vi.fn();
+    const onProgress = rs.fn();
 
-    await (server as any).startScrcpy(adb, { maxSize: 720 }, onProgress);
+    await (server as any).startScrcpy(
+      adb,
+      { maxSize: 0, videoBitRate: 8_000_000 },
+      onProgress,
+    );
 
-    expect(mockPushServer).toHaveBeenCalledOnce();
+    expect(mockExecFile).toHaveBeenCalledWith(
+      'adb',
+      [
+        '-s',
+        'device-1',
+        'push',
+        '/unpacked/scrcpy-server',
+        '/mocked/scrcpy-server.jar',
+      ],
+      expect.any(Function),
+    );
+    expect(mockResolveExternalResourcePath).toHaveBeenCalledWith(
+      expect.stringContaining('bin/scrcpy-server'),
+    );
     expect(mockOptionsCtor).toHaveBeenCalledWith(
       expect.objectContaining({
         audio: false,
         control: true,
-        maxSize: 720,
+        maxSize: 0,
         sendFrameMeta: true,
-        videoBitRate: 2_000_000,
+        videoBitRate: 8_000_000,
       }),
     );
     expect(mockStart).toHaveBeenCalledWith(
@@ -92,15 +122,15 @@ describe('ScrcpyServer', () => {
   });
 
   it('can consume device list updates from an external discovery source', async () => {
-    const unsubscribe = vi.fn();
-    const getDevices = vi.fn().mockResolvedValue([
+    const unsubscribe = rs.fn();
+    const getDevices = rs.fn().mockResolvedValue([
       {
         id: 'device-1',
         name: 'Pixel 9',
         status: 'device',
       },
     ]);
-    const subscribe = vi.fn((listener: (devices: any[]) => void) => {
+    const subscribe = rs.fn((listener: (devices: any[]) => void) => {
       listener([
         {
           id: 'device-2',
@@ -117,7 +147,7 @@ describe('ScrcpyServer', () => {
         subscribe,
       },
     });
-    const emitSpy = vi.spyOn(server.io, 'emit');
+    const emitSpy = rs.spyOn(server.io, 'emit');
 
     (server as any).startDeviceMonitoring();
     await Promise.resolve();

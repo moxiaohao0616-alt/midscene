@@ -3,15 +3,119 @@ import type {
   DetailedLocateParam,
   LocateOption,
   MidsceneYamlScript,
+  MidsceneYamlScriptWebEnv,
 } from '@/types';
 import { getDebug } from '@midscene/shared/logger';
 import { assert } from '@midscene/shared/utils';
 import yaml from 'js-yaml';
+import { buildLocatePromptWithContext } from '../agent/prompt-context';
 
 const debugUtils = getDebug('yaml:utils');
 
 const topLevelTasksPattern = /^tasks\s*:/;
 const topLevelYamlKeyPattern = /^[^\s#][^:]*:/;
+
+export type WebTargetSource = 'page' | 'browser' | 'web' | 'target';
+
+export type ResolvedWebTarget = {
+  source: WebTargetSource;
+  target: Partial<MidsceneYamlScriptWebEnv> & { mode: 'page' | 'browser' };
+  mode: 'page' | 'browser';
+};
+
+export type WebTargetConfig = Partial<
+  Record<WebTargetSource, Partial<MidsceneYamlScriptWebEnv>>
+>;
+
+const webTargetSources: WebTargetSource[] = [
+  'page',
+  'browser',
+  'web',
+  'target',
+];
+
+export function resolveWebTarget(
+  config: WebTargetConfig,
+): ResolvedWebTarget | undefined {
+  const entries = webTargetSources
+    .map((source) => [source, config[source]] as const)
+    .filter(
+      (
+        entry,
+      ): entry is readonly [
+        WebTargetSource,
+        Partial<MidsceneYamlScriptWebEnv>,
+      ] => typeof entry[1] !== 'undefined',
+    );
+
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  if (entries.length > 1) {
+    const specifiedTargets = entries.map(([source]) => source);
+    throw new Error(
+      `[midscene] Only one web target can be specified, but found multiple: ${specifiedTargets.join(
+        ', ',
+      )}. Please specify only one of: page, browser, web, or target.`,
+    );
+  }
+
+  const [source, target] = entries[0];
+  const explicitMode = target.mode;
+  if (
+    typeof explicitMode !== 'undefined' &&
+    explicitMode !== 'page' &&
+    explicitMode !== 'browser'
+  ) {
+    throw new Error(
+      `[midscene] web target mode must be either "page" or "browser", but got "${explicitMode}".`,
+    );
+  }
+
+  if (source === 'page' && explicitMode === 'browser') {
+    throw new Error(
+      '[midscene] page target cannot use mode: browser. Use browser: instead.',
+    );
+  }
+
+  if (source === 'browser' && explicitMode === 'page') {
+    throw new Error(
+      '[midscene] browser target cannot use mode: page. Use page: instead.',
+    );
+  }
+
+  const mode =
+    source === 'page'
+      ? 'page'
+      : source === 'browser'
+        ? 'browser'
+        : (explicitMode ?? 'page');
+
+  if (mode === 'page' && target.autoFollowNewPage) {
+    throw new Error(
+      '[midscene] autoFollowNewPage requires browser mode. Use browser: or web.mode: browser.',
+    );
+  }
+
+  if (
+    mode === 'browser' &&
+    typeof target.forceSameTabNavigation !== 'undefined'
+  ) {
+    throw new Error(
+      '[midscene] forceSameTabNavigation cannot be used in browser mode. Use page: or web.mode: page when same-tab navigation is required.',
+    );
+  }
+
+  return {
+    source,
+    mode,
+    target: {
+      ...target,
+      mode,
+    },
+  };
+}
 
 function interpolateEnvVarRefs(
   value: string,
@@ -152,6 +256,7 @@ export function parseYamlScript(
   }) as MidsceneYamlScript;
 
   const pathTip = filePath ? `, failed to load ${filePath}` : '';
+  resolveWebTarget(obj);
   assert(obj.tasks, `property "tasks" is required in yaml script ${pathTip}`);
   assert(
     Array.isArray(obj.tasks),
@@ -211,6 +316,10 @@ export function buildDetailedLocateParam(
     return undefined;
   }
 
+  const promptDisplay = typeof prompt === 'string' ? prompt : prompt.prompt;
+  const context = opt?.context?.trim() || undefined;
+  prompt = buildLocatePromptWithContext(prompt, opt?.context);
+
   const multimodalPrompt = extractMultimodalPrompt(opt);
   if (multimodalPrompt) {
     prompt =
@@ -227,6 +336,7 @@ export function buildDetailedLocateParam(
 
   return {
     prompt,
+    ...(context ? { promptDisplay, context } : {}),
     deepLocate,
     cacheable,
     xpath,
@@ -251,7 +361,7 @@ export function buildDetailedLocateParamAndRestParams(
     // Get all keys from opt
     const allKeys = Object.keys(opt);
 
-    // Keys already included in locateParam: prompt, deepLocate, cacheable, xpath
+    // `context` has already been merged into the locate prompt.
     const locateParamKeys = Object.keys(locateParam || {});
     const multimodalPromptKeys =
       typeof locateParam?.prompt === 'object' && locateParam?.prompt !== null
@@ -262,6 +372,8 @@ export function buildDetailedLocateParamAndRestParams(
     for (const key of allKeys) {
       if (
         !locateParamKeys.includes(key) &&
+        key !== 'context' &&
+        key !== 'deepThink' &&
         !multimodalPromptKeys.includes(key) &&
         !excludeKeys.includes(key) &&
         key !== 'locate'

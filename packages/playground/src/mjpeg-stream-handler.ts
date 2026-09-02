@@ -22,6 +22,13 @@ const ERROR_LOG_THRESHOLD = 3;
 
 type ActiveInterface = PageAgent['interface'];
 
+function toMjpegFrameDataUrl(data: string, contentType?: string) {
+  if (data.startsWith('data:')) {
+    return data;
+  }
+  return `data:${contentType || 'image/jpeg'};base64,${data}`;
+}
+
 /**
  * Inputs the handler reads on every request, late-bound through callbacks
  * so a single handler instance can survive across device reconnects without
@@ -62,6 +69,7 @@ export interface MjpegStreamSource {
 export class MjpegStreamHandler {
   private nativeAvailable: boolean | null = null;
   private nativeFailedAt: number | null = null;
+  private lastPollingFrame?: string;
   private readonly interfaceMjpegHub: InterfaceMjpegHub =
     createInterfaceMjpegHub({
       initialFrameTimeoutMs: INTERFACE_MJPEG_INITIAL_FRAME_TIMEOUT_MS,
@@ -75,11 +83,25 @@ export class MjpegStreamHandler {
   reset(): void {
     this.nativeAvailable = null;
     this.nativeFailedAt = null;
+    this.lastPollingFrame = undefined;
     this.interfaceMjpegHub.stopProducer();
   }
 
   shutdown(): void {
     this.interfaceMjpegHub.shutdown();
+  }
+
+  getLastFrameBase64(): string | undefined {
+    const interfaceFrame = this.interfaceMjpegHub.getLastFrame();
+    if (interfaceFrame) {
+      return toMjpegFrameDataUrl(
+        interfaceFrame.data,
+        interfaceFrame.contentType,
+      );
+    }
+    return this.lastPollingFrame
+      ? toMjpegFrameDataUrl(this.lastPollingFrame)
+      : undefined;
   }
 
   async serve(req: Request, res: Response): Promise<void> {
@@ -237,6 +259,7 @@ export class MjpegStreamHandler {
         const base64 = await this.source.takeScreenshot();
         if (stopped) break;
         consecutiveErrors = 0;
+        this.lastPollingFrame = base64;
 
         writeMjpegFrame(res, boundary, {
           data: base64,

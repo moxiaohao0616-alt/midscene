@@ -4,7 +4,17 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'apps/site/**'
+      - '.changeset/**'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'apps/site/**'
+      - '.changeset/**'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
@@ -13,7 +23,8 @@ permissions:
 
 jobs:
   main:
-    runs-on: ubuntu-latest
+    # The viewport e2e relies on the hosted image's Chrome window behavior.
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         node-version: [24.13.0]
@@ -23,8 +34,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      with:
-        fetch-depth: 0
 
     - name: Setup pnpm
       uses: pnpm/action-setup@eae0cfeb286e66ffb5155f1a79b90583a127a68b # v2.4.1
@@ -37,7 +46,7 @@ jobs:
         node-version: '24.13.0'
 
     - name: Cache Puppeteer dependencies
-      uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3.5.0
+      uses: ./.github/actions/cache/restore
       id: cache-puppeteer
       with:
         path: ~/.cache/puppeteer
@@ -53,17 +62,75 @@ jobs:
         cd packages/web-integration
         npx puppeteer browsers install chrome
 
+    - name: Save Puppeteer cache
+      if: steps.cache-puppeteer.outputs.cache-hit != 'true'
+      uses: ./.github/actions/cache/save
+      with:
+        path: ~/.cache/puppeteer
+        key: ${{ runner.os }}-puppeteer-${{ hashFiles('pnpm-lock.yaml') }}
+
     - name: Check tsconfig references
       run: pnpm run check:references
 
     - name: Build project
       run: pnpm run build
 
+    - name: Check Report build feedback loop
+      run: pnpm run check:report-build-feedback-loop
+
+    - name: Check CLI CJS bundle on minimum supported Node
+      run: |
+        node - <<'EOF'
+        const { readdirSync, readFileSync, statSync } = require('node:fs');
+        const { join } = require('node:path');
+
+        const root = 'packages/cli/dist/lib';
+        const files = [];
+        const collectJsFiles = (dir) => {
+          for (const entry of readdirSync(dir)) {
+            const file = join(dir, entry);
+            if (statSync(file).isDirectory()) {
+              collectJsFiles(file);
+            } else if (file.endsWith('.js')) {
+              files.push(file);
+            }
+          }
+        };
+        collectJsFiles(root);
+
+        const staticRequirePatterns = [
+          {
+            name: '@rstest/core',
+            pattern: /require\((['"])@rstest\/core(?:\/[^'"]*)?\1\)/,
+          },
+          {
+            name: '@rsbuild/core',
+            pattern: /require\((['"])@rsbuild\/core(?:\/[^'"]*)?\1\)/,
+          },
+        ];
+
+        for (const file of files) {
+          const content = readFileSync(file, 'utf8');
+          for (const { name, pattern } of staticRequirePatterns) {
+            if (pattern.test(content)) {
+              throw new Error(`${file} contains a static require("${name}")`);
+            }
+          }
+        }
+        EOF
+        npx -y node@20.19.0 packages/cli/dist/lib/index.js --version
+
     - name: Type check tests
       run: pnpm run type-check:tests
 
     - name: Run tests with coverage
       run: pnpm run test:coverage
+
+    # Run the Chrome/YAML batch after full-workspace coverage so it does not compete
+    # with the other Nx projects for runner resources.
+    - name: Run CLI shared-browser YAML e2e
+      timeout-minutes: 5
+      run: pnpm --filter @midscene/cli test:e2e:shared-browser
 
     - name: Upload coverage reports
       id: upload-coverage

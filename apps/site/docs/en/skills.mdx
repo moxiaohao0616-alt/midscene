@@ -1,8 +1,8 @@
 # Control any platform with Skills
 
-[Agent Skills](https://github.com/anthropics/skills) are a format for extending AI coding agents with specialized capabilities. Midscene provides Agent Skills that let AI coding tools (like Claude Code, Cline, etc.) drive UI automation through CLI commands — no MCP server setup required.
+[Agent Skills](https://github.com/anthropics/skills) are a format for extending AI coding agents with specialized capabilities. Midscene provides Agent Skills that let AI coding tools (like Claude Code, Cline, etc.) drive UI automation through CLI commands.
 
-Unlike [MCP integration](./mcp), Skills work by running CLI commands directly in the terminal. The AI agent acts as the brain: it takes screenshots, analyzes the UI, and decides which actions to perform next.
+Skills work by running CLI commands directly in the terminal. The AI agent acts as the brain: it takes screenshots, analyzes the UI, and decides which actions to perform next.
 
 ## Supported platforms
 
@@ -15,6 +15,26 @@ Unlike [MCP integration](./mcp), Skills work by running CLI commands directly in
 | HarmonyOS Device Automation | `@midscene/harmony` | `npx @midscene/harmony` | HarmonyOS device control via HDC |
 
 In default Puppeteer mode, you can override the default `1440x800` viewport with `--viewport-width <width>` and `--viewport-height <height>`. These flags are only supported in default Puppeteer mode, not in `--bridge` or `--cdp` mode.
+
+In CDP mode, use a separate `--extra-http-header 'Name:Value'` option for each HTTP header added to page requests. Repeat the option on every separate CLI command that may issue requests because each command creates a new CDP session:
+
+```bash
+npx @midscene/web connect \
+  --cdp ws://127.0.0.1:9222/devtools/browser \
+  --extra-http-header 'x-use-ppe:1' \
+  --extra-http-header 'x-tt-env:ppe_example' \
+  --url https://example.com
+
+npx @midscene/web act \
+  --cdp ws://127.0.0.1:9222/devtools/browser \
+  --extra-http-header 'x-use-ppe:1' \
+  --extra-http-header 'x-tt-env:ppe_example' \
+  --prompt "click the button"
+```
+
+The headers are applied before `connect --url` navigates, so the initial document request includes them. Avoid putting sensitive authentication values directly in shell history.
+
+If Chrome is installed in a non-standard location, set `MIDSCENE_CHROME_PATH` to the Chrome executable path. `MIDSCENE_MCP_CHROME_PATH` is still accepted as a temporary migration alias.
 
 ## Installation
 
@@ -35,7 +55,7 @@ Skills repository: [github.com/web-infra-dev/midscene-skills](https://github.com
 
 ## Model configuration
 
-Midscene skills require a vision model with strong visual grounding capabilities. Configure the following environment variables — either as system environment variables or in a `.env` file in the current working directory (Midscene loads `.env` automatically):
+Midscene skills require a multimodal model with strong UI localization. Configure the following environment variables — either as system environment variables or in a `.env` file in the current working directory (Midscene loads `.env` automatically):
 
 ```bash
 MIDSCENE_MODEL_API_KEY="your-api-key"
@@ -44,15 +64,13 @@ MIDSCENE_MODEL_BASE_URL="https://..."
 MIDSCENE_MODEL_FAMILY="family-identifier"
 ```
 
-For supported models and configuration details, see [Model strategy](./model-strategy) and [Common model configuration](./model-common-config).
+For supported models and configuration details, see [Supported models and setup](./model-common-config).
 
 ## Use skills
 
-In your AI chat assistant, you can use the following command to use skills:
+Once installed, just describe the task in natural language to your AI coding agent. It picks the right Skill, runs the CLI, reads the screenshots, and decides what to do next — for example:
 
-```markdown
-Open photo app, see what is the first photo in the album.
-```
+> Open the photo app and tell me the first photo in the album.
 
 ## Example: Coding Agent self-verifies after writing code
 

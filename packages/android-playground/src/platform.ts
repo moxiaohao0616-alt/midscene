@@ -1,6 +1,7 @@
 import path from 'node:path';
 import {
   AndroidAgent,
+  type AndroidAgentOpt,
   AndroidDevice,
   getConnectedDevicesWithDetails,
 } from '@midscene/android';
@@ -15,12 +16,17 @@ import {
   SCRCPY_SERVER_PORT,
 } from '@midscene/shared/constants';
 import { findAvailablePort } from '@midscene/shared/node';
-import type ScrcpyServer from './scrcpy-server';
+export interface ScrcpyServerController {
+  currentDeviceId: string | null;
+  launch(port?: number): Promise<unknown>;
+  close(): unknown;
+}
 
 export interface AndroidPlatformOptions {
   staticDir?: string;
-  scrcpyServer?: ScrcpyServer;
+  scrcpyServer?: ScrcpyServerController;
   scrcpyPort?: number;
+  getAgentOptions?: () => AndroidAgentOpt;
 }
 
 async function getAdbTargets(): Promise<PlaygroundSessionTarget[]> {
@@ -133,7 +139,7 @@ export const androidPlaygroundPlatform = definePlaygroundPlatform<
         const connectAgent = async () => {
           const device = new AndroidDevice(deviceId);
           await device.connect();
-          return new AndroidAgent(device);
+          return new AndroidAgent(device, options?.getAgentOptions?.());
         };
 
         if (options?.scrcpyServer) {
@@ -170,7 +176,7 @@ export const androidPlaygroundPlatform = definePlaygroundPlatform<
                 await options.scrcpyServer?.launch(scrcpyPort);
               },
               stop: async () => {
-                options.scrcpyServer?.close();
+                await options.scrcpyServer?.close();
               },
             },
           ]

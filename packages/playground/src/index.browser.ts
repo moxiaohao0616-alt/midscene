@@ -42,6 +42,7 @@ export type {
   PlaygroundConfig,
   ExecutionType,
   PlaygroundAdapter,
+  PlaygroundReportRef,
 } from './types';
 export type {
   PlaygroundCreatedSession,
@@ -53,6 +54,7 @@ export type {
   PlaygroundPreviewDescriptor,
   PlaygroundPreviewKind,
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeResult,
   PlaygroundRecorderEvent,
   PlaygroundRecorderEventsResult,
   PlaygroundRecorderSourceKind,

@@ -47,6 +47,11 @@ Usage:
         string: true,
         description: 'A list of yaml files to run, separated by space',
       },
+      setup: {
+        type: 'string',
+        description:
+          'A yaml file to run before the main files. Puppeteer Web setup requires --share-browser-context',
+      },
       config: {
         type: 'string',
         description:
@@ -78,7 +83,7 @@ Usage:
       },
       'share-browser-context': {
         type: 'boolean',
-        description: `Share browser context across multiple yaml files, default is ${defaultConfig.shareBrowserContext}`,
+        description: `Share a Puppeteer Web browser context across multiple yaml files, default is ${defaultConfig.shareBrowserContext}`,
       },
       'dotenv-override': {
         type: 'boolean',
@@ -99,6 +104,7 @@ Usage:
 Examples:
   $0 script.yaml --web.user-agent "Custom Agent" --web.viewport-width 1920
   $0 script.yaml --android.device-id emulator-5554 --android.ime-strategy yadb-for-non-ascii
+  $0 script.yaml --android.device-id emulator-5554 --android.screenshot-strategy always-yadb
   $0 script.yaml --ios.wda-port 8100 --ios.auto-dismiss-keyboard`)
     .wrap(yargs().terminalWidth());
 

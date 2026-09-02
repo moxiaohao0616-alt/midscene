@@ -1,8 +1,11 @@
 import path from 'node:path';
 import { PuppeteerAgent } from '@/puppeteer';
-import { generateCommonTools } from '@midscene/shared/mcp/tool-generator';
-import type { BaseAgent, ToolDefinition } from '@midscene/shared/mcp/types';
-import { describe, expect, it } from 'vitest';
+import { generateCommonTools } from '@midscene/shared/agent-tools/tool-generator';
+import type {
+  BaseAgent,
+  ToolDefinition,
+} from '@midscene/shared/agent-tools/types';
+import { describe, expect, it } from '@rstest/core';
 import { createTestContext } from './test-utils';
 import { launchPage } from './utils';
 
@@ -12,7 +15,7 @@ const GITHUB_LOGO_FIXTURE = path.resolve(
 );
 
 /**
- * Exercise the CLI / MCP `assert` tool exposed by `generateCommonTools`
+ * Exercise the CLI `assert` tool exposed by `generateCommonTools`
  * with multimodal image params. This proves the CLI handler path
  * (`npx @midscene/* assert --prompt … --image … --image-name …`) forwards the image
  * reference all the way to `agent.aiAssert` and the real model call
@@ -20,6 +23,10 @@ const GITHUB_LOGO_FIXTURE = path.resolve(
  */
 describe(
   'CLI assert tool with image prompts',
+  {
+    // AI calls are slow; keep these inside the project's standard AI budget.
+    timeout: 3 * 60 * 1000,
+  },
   () => {
     const ctx = createTestContext();
 
@@ -95,9 +102,5 @@ describe(
 
       expect(result.isError).toBe(true);
     });
-  },
-  {
-    // AI calls are slow; keep these inside the project's standard AI budget.
-    timeout: 3 * 60 * 1000,
   },
 );

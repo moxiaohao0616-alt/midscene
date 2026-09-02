@@ -1,0 +1,198 @@
+import type { ParsedPlanningLocateParameter } from '@/ai-model/model-adapter/planning-protocol';
+import { normalizePlanningActionLocateFields } from '@/ai-model/workflows/planning/locate-normalization';
+import { getMidsceneLocationSchema } from '@/common';
+import type { DeviceAction } from '@/device';
+import type { PlanningAction } from '@/types';
+import { describe, expect, it, rs } from '@rstest/core';
+import { z } from 'zod';
+
+const actionSpace: DeviceAction[] = [
+  {
+    name: 'Tap',
+    description: 'Tap the element',
+    paramSchema: z.object({
+      locate: getMidsceneLocationSchema(),
+    }),
+    call: async () => undefined,
+  },
+];
+
+const locateResultContext = {
+  preparedSize: {
+    width: 100,
+    height: 100,
+  },
+};
+
+const parseRawLocateParameter = (value: unknown) =>
+  value as ParsedPlanningLocateParameter;
+
+describe('normalizePlanningActionLocateFields', () => {
+  it('leaves actions unchanged when the planned action is outside the action space', () => {
+    const toPixelBbox = rs.fn();
+    const actions: PlanningAction[] = [
+      {
+        type: 'UnknownAction',
+        param: {},
+      },
+    ];
+
+    normalizePlanningActionLocateFields(actions, {
+      actionSpace,
+      includeLocateInPlanning: true,
+      locateResultCodec: {
+        promptSpec: { resultKey: 'point' },
+        toPixelBbox,
+      } as any,
+      locateResultContext,
+      parseRawLocateParameter,
+    });
+
+    expect(toPixelBbox).not.toHaveBeenCalled();
+    expect(actions).toEqual([
+      {
+        type: 'UnknownAction',
+        param: {},
+      },
+    ]);
+  });
+
+  it('normalizes locate params with the configured locate codec', () => {
+    const toPixelBbox = rs.fn(() => [10, 20, 30, 40]);
+    const actions: PlanningAction[] = [
+      {
+        type: 'Tap',
+        param: {
+          locate: {
+            prompt: 'submit',
+            deepLocate: true,
+            cacheable: false,
+            xpath: '//button[@type="submit"]',
+            point: [50, 60],
+          },
+        },
+      },
+    ];
+
+    normalizePlanningActionLocateFields(actions, {
+      actionSpace,
+      includeLocateInPlanning: true,
+      locateResultCodec: {
+        promptSpec: { resultKey: 'point' },
+        toPixelBbox,
+      } as any,
+      locateResultContext,
+      parseRawLocateParameter,
+    });
+
+    expect(toPixelBbox).toHaveBeenCalledWith([50, 60], locateResultContext);
+    expect(actions[0].param.locate).toEqual({
+      prompt: 'submit',
+      deepLocate: true,
+      cacheable: false,
+      xpath: '//button[@type="submit"]',
+      locatedPixelBbox: [10, 20, 30, 40],
+    });
+  });
+
+  it('accepts bbox_2d when the model adapter enables the alias', () => {
+    const toPixelBbox = rs.fn(() => [10, 20, 30, 40]);
+    const actions: PlanningAction[] = [
+      {
+        type: 'Tap',
+        param: {
+          locate: {
+            prompt: 'submit',
+            bbox_2d: [50, 60, 70, 80],
+          },
+        },
+      },
+    ];
+
+    normalizePlanningActionLocateFields(actions, {
+      actionSpace,
+      includeLocateInPlanning: true,
+      locateResultCodec: {
+        promptSpec: { resultKey: 'bbox' },
+        toPixelBbox,
+      } as any,
+      locateResultContext,
+      acceptBbox2dAlias: true,
+      parseRawLocateParameter,
+    });
+
+    expect(toPixelBbox).toHaveBeenCalledWith(
+      [50, 60, 70, 80],
+      locateResultContext,
+    );
+    expect(actions[0].param.locate).toEqual({
+      prompt: 'submit',
+      locatedPixelBbox: [10, 20, 30, 40],
+    });
+  });
+
+  it('parses protocol-specific locate params after identifying locator fields', () => {
+    const parseProtocolLocateParameter = rs.fn(() => ({
+      prompt: 'submit',
+      point: [50, 60],
+    }));
+    const toPixelBbox = rs.fn(() => [10, 20, 30, 40]);
+    const actions: PlanningAction[] = [
+      {
+        type: 'Tap',
+        param: {
+          locate: '<prompt>submit</prompt><point>50 60</point>',
+        },
+      },
+    ];
+
+    normalizePlanningActionLocateFields(actions, {
+      actionSpace,
+      includeLocateInPlanning: true,
+      locateResultCodec: {
+        promptSpec: { resultKey: 'point' },
+        toPixelBbox,
+      } as any,
+      locateResultContext,
+      parseRawLocateParameter: parseProtocolLocateParameter,
+    });
+
+    expect(parseProtocolLocateParameter).toHaveBeenCalledWith(
+      '<prompt>submit</prompt><point>50 60</point>',
+    );
+    expect(toPixelBbox).toHaveBeenCalledWith([50, 60], locateResultContext);
+    expect(actions[0].param.locate).toEqual({
+      prompt: 'submit',
+      locatedPixelBbox: [10, 20, 30, 40],
+    });
+  });
+
+  it('keeps only the prompt in prompt-only planning mode', () => {
+    const toPixelBbox = rs.fn();
+    const actions: PlanningAction[] = [
+      {
+        type: 'Tap',
+        param: {
+          locate: {
+            prompt: 'submit',
+            point: [50, 60],
+          },
+        },
+      },
+    ];
+
+    normalizePlanningActionLocateFields(actions, {
+      actionSpace,
+      includeLocateInPlanning: false,
+      locateResultCodec: {
+        promptSpec: { resultKey: 'point' },
+        toPixelBbox,
+      } as any,
+      locateResultContext,
+      parseRawLocateParameter,
+    });
+
+    expect(toPixelBbox).not.toHaveBeenCalled();
+    expect(actions[0].param.locate).toEqual({ prompt: 'submit' });
+  });
+});

@@ -1,25 +1,58 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  createReadStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { stat } from 'node:fs/promises';
 import type { Server } from 'node:http';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
+  AgentDescribeElementAtPointResult,
   DeviceAction,
+  ElementDescriberRuntime,
   ExecutionDump,
   ExecutionTask,
   ExecutorContext,
 } from '@midscene/core';
-import { ReportActionDump, runConnectivityTest } from '@midscene/core';
+import {
+  type ReportActionDump,
+  describeElementAtPoint,
+  runConnectivityTest,
+} from '@midscene/core';
 import type { Agent as PageAgent } from '@midscene/core/agent';
+import { getModelRuntime } from '@midscene/core/ai-model';
+import {
+  imageMimeTypeForFileExtension,
+  parseBase64ImageDataUrl,
+} from '@midscene/core/dump';
 import { getTmpDir, sleep } from '@midscene/core/utils';
+import { getMidsceneRunSubDir } from '@midscene/shared/common';
 import { PLAYGROUND_SERVER_PORT } from '@midscene/shared/constants';
 import {
+  ModelConfigManager,
   globalModelConfigManager,
   overrideAIConfig,
 } from '@midscene/shared/env';
 import { generateElementByPoint } from '@midscene/shared/extractor';
-import { compositePointMarkerImg } from '@midscene/shared/img';
+import { annotateRects, imageInfoOfBase64 } from '@midscene/shared/img';
 import { getDebug } from '@midscene/shared/logger';
-import { uuid } from '@midscene/shared/utils';
+import type {
+  MidsceneRecorderScreenshotAssetRef,
+  MidsceneRecorderSemantic,
+  MidsceneRecorderSemanticAction,
+} from '@midscene/shared/recorder';
+import {
+  buildMidsceneRecorderActionSummary,
+  buildMidsceneRecorderReplayInstruction,
+} from '@midscene/shared/recorder';
+import { antiEscapeScriptTag, uuid } from '@midscene/shared/utils';
 import express, { type Request, type Response } from 'express';
 import { executeAction, formatErrorMessage } from './common';
 import { MjpegStreamHandler } from './mjpeg-stream-handler';
@@ -28,8 +61,11 @@ import type {
   PlaygroundExecutionHooks,
   PlaygroundPreviewDescriptor,
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeTrace,
   PlaygroundRecorderEvent,
   PlaygroundSessionManager,
+  PlaygroundSessionNavigationEvent,
+  PlaygroundSessionNavigationSubscriber,
   PlaygroundSessionSetup,
   PlaygroundSessionState,
   PlaygroundSessionTarget,
@@ -41,12 +77,707 @@ import {
   type PlaygroundRuntimeInfo,
   buildRuntimeInfo,
 } from './runtime-metadata';
-import type { AgentFactory } from './types';
+import type { AgentFactory, PlaygroundReportRef } from './types';
 
 import 'dotenv/config';
 
 const defaultPort = PLAYGROUND_SERVER_PORT;
 const RECORDER_CAPTURE_AFTER_INTERACT_DELAY_MS = 250;
+const RECORDER_TYPE_ONLY_INPUT_SETTLE_DELAY_MS = 750;
+const RECORDER_AI_DESCRIBE_AFTER_INTERACT_TIMEOUT_MS = 30_000;
+const RECORDER_AI_DESCRIBE_VERIFY_PROMPT = false;
+const RECORDER_AI_DESCRIBE_SCREENSHOT_DUMP_DIR =
+  'recorder-ai-describe-screenshots';
+const RECORDER_SCREENSHOT_ASSET_DIR = 'recorder-screenshots';
+const RECORDER_SCREENSHOT_ASSET_MAX_SESSION_BYTES = 128 * 1024 * 1024;
+const RECORDER_SCREENSHOT_ASSET_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const PLAYGROUND_REPORT_REF_TTL_MS = 60 * 60 * 1000;
+const REPORT_DUMP_OPEN_TAG = '<script type="midscene_web_dump"';
+const REPORT_IMAGE_CLOSE_TAG = '</script>';
+const recorderScreenshotAssetQuotaExceededSessions = new Set<string>();
+const recorderScreenshotAssetBytesBySession = new Map<string, number>();
+let recorderScreenshotAssetUsageInitialized = false;
+
+async function extractLastReportDump(reportPath: string): Promise<string> {
+  let pending = '';
+  let current = '';
+  let last = '';
+  let capturing = false;
+
+  for await (const rawChunk of createReadStream(reportPath, {
+    encoding: 'utf8',
+  })) {
+    let chunk = pending + rawChunk;
+    pending = '';
+
+    while (chunk) {
+      if (!capturing) {
+        const openIndex = chunk.indexOf(REPORT_DUMP_OPEN_TAG);
+        if (openIndex === -1) {
+          pending = chunk.slice(-(REPORT_DUMP_OPEN_TAG.length - 1));
+          break;
+        }
+        const tagEndIndex = chunk.indexOf('>', openIndex);
+        if (tagEndIndex === -1) {
+          pending = chunk.slice(openIndex);
+          break;
+        }
+        capturing = true;
+        current = '';
+        chunk = chunk.slice(tagEndIndex + 1);
+        continue;
+      }
+
+      const closeIndex = chunk.indexOf(REPORT_IMAGE_CLOSE_TAG);
+      if (closeIndex === -1) {
+        const retainedLength = REPORT_IMAGE_CLOSE_TAG.length - 1;
+        current += chunk.slice(0, -retainedLength);
+        pending = chunk.slice(-retainedLength);
+        break;
+      }
+      current += chunk.slice(0, closeIndex);
+      last = current.trim();
+      current = '';
+      capturing = false;
+      chunk = chunk.slice(closeIndex + REPORT_IMAGE_CLOSE_TAG.length);
+    }
+  }
+
+  if (!last) throw new Error('No replay dump found in report');
+  return antiEscapeScriptTag(last);
+}
+
+async function extractInlineReportImage(
+  reportPath: string,
+  imageId: string,
+): Promise<string | null> {
+  const openTag = `<script type="midscene-image" data-id="${imageId}">`;
+  let pending = '';
+  let content = '';
+  let capturing = false;
+
+  for await (const rawChunk of createReadStream(reportPath, {
+    encoding: 'utf8',
+  })) {
+    let chunk = pending + rawChunk;
+    pending = '';
+
+    if (!capturing) {
+      const openIndex = chunk.indexOf(openTag);
+      if (openIndex === -1) {
+        pending = chunk.slice(-(openTag.length - 1));
+        continue;
+      }
+      capturing = true;
+      chunk = chunk.slice(openIndex + openTag.length);
+    }
+
+    const closeIndex = chunk.indexOf(REPORT_IMAGE_CLOSE_TAG);
+    if (closeIndex !== -1) {
+      content += chunk.slice(0, closeIndex);
+      return antiEscapeScriptTag(content.trim());
+    }
+
+    const retainedLength = REPORT_IMAGE_CLOSE_TAG.length - 1;
+    content += chunk.slice(0, -retainedLength);
+    pending = chunk.slice(-retainedLength);
+  }
+
+  return null;
+}
+
+function shouldPersistStudioPreviewRecorderScreenshot(actionType: string) {
+  return [
+    'Tap',
+    'DoubleClick',
+    'LongPress',
+    'RightClick',
+    'DragAndDrop',
+    'Input',
+  ].includes(actionType);
+}
+
+function createElementDescriberRuntime(
+  agent: PageAgent,
+): ElementDescriberRuntime {
+  const modelConfigManager = agent.modelConfigManager;
+  const missingModelRuntime =
+    undefined as unknown as ElementDescriberRuntime['describeModelRuntime'];
+  return {
+    service: agent.service,
+    describeModelRuntime: modelConfigManager
+      ? getModelRuntime(modelConfigManager.getModelConfig('insight'))
+      : missingModelRuntime,
+    locateModelRuntime: modelConfigManager
+      ? getModelRuntime(modelConfigManager.getModelConfig('default'))
+      : missingModelRuntime,
+  };
+}
+
+function extractBase64Payload(value: string): {
+  base64: string;
+  mimeType?: string;
+} {
+  const dataUrlMatch = value.match(/^data:([^;,]+)?(?:;[^,]*)?,([\s\S]*)$/);
+  if (dataUrlMatch) {
+    return {
+      mimeType: dataUrlMatch[1],
+      base64: dataUrlMatch[2] || '',
+    };
+  }
+  return { base64: value };
+}
+
+function estimateBase64Bytes(value?: string): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const { base64 } = extractBase64Payload(value);
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+function buildRecorderRawPayloadSummary(
+  rawPayload?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (!rawPayload) {
+    return undefined;
+  }
+
+  const allowedKeys = [
+    'actionType',
+    'x',
+    'y',
+    'endX',
+    'endY',
+    'duration',
+    'direction',
+    'scrollType',
+    'distance',
+    'keyName',
+    'mode',
+  ];
+  const summary: Record<string, unknown> = {};
+  for (const key of allowedKeys) {
+    if (rawPayload[key] !== undefined) {
+      summary[key] = rawPayload[key];
+    }
+  }
+
+  const value = rawPayload.value;
+  if (typeof value === 'string') {
+    summary.valueLength = value.length;
+  }
+
+  return Object.keys(summary).length > 0 ? summary : undefined;
+}
+
+function buildRecorderEventSummary(event: PlaygroundRecorderEvent) {
+  return {
+    hashId: event.hashId,
+    mergedHashIds: event.mergedHashIds,
+    type: event.type,
+    source: event.source,
+    actionType: event.actionType,
+    timestamp: event.timestamp,
+    url: event.url,
+    title: event.title,
+    valueLength:
+      typeof event.value === 'string' ? event.value.length : undefined,
+    rawPayloadSummary: buildRecorderRawPayloadSummary(event.rawPayload),
+    elementRect: event.elementRect,
+    pageInfo: event.pageInfo,
+  };
+}
+
+type RecorderAiDescribeScreenshotRef = NonNullable<
+  PlaygroundRecorderDescribeTrace['screenshotRef']
+>;
+type RecorderAiDescribeScreenshotAnnotation = NonNullable<
+  PlaygroundRecorderDescribeTrace['screenshotAnnotation']
+>;
+
+function sanitizeRecorderPathSegment(
+  value: unknown,
+  fallback: string,
+  maxLength = 64,
+) {
+  const normalized =
+    typeof value === 'string' && value.trim() ? value.trim() : fallback;
+  const sanitized = normalized
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+  return (sanitized || fallback).slice(0, maxLength);
+}
+
+function formatRecorderAiDescribeScreenshotPathParts() {
+  const date = new Date();
+  const localDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const pad = (value: number, length = 2) =>
+    String(value).padStart(length, '0');
+  const datePart = [
+    localDate.getFullYear(),
+    pad(localDate.getMonth() + 1),
+    pad(localDate.getDate()),
+  ].join('-');
+  const timePart = [
+    pad(localDate.getHours()),
+    pad(localDate.getMinutes()),
+    pad(localDate.getSeconds()),
+    pad(localDate.getMilliseconds(), 3),
+  ].join('-');
+  const hourPart = timePart.slice(0, 2) || 'unknown-hour';
+  return {
+    datePart,
+    hourPart,
+    filePrefix: `${timePart}_${randomUUID()}`,
+  };
+}
+
+function assertPathInsideDirectory(rootDir: string, targetPath: string) {
+  const resolvedRoot = resolve(rootDir);
+  const resolvedTarget = resolve(targetPath);
+  if (
+    resolvedTarget !== resolvedRoot &&
+    !resolvedTarget.startsWith(`${resolvedRoot}${sep}`)
+  ) {
+    throw new Error(`Refusing to write recorder dump outside ${resolvedRoot}`);
+  }
+  return resolvedTarget;
+}
+
+function writeRecorderAiDescribeScreenshot(
+  imageBase64: string,
+  suffix: string,
+): RecorderAiDescribeScreenshotRef {
+  const { base64, mimeType } = extractBase64Payload(imageBase64);
+  const bytes = Buffer.from(base64, 'base64');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const extension = mimeType?.includes('jpeg') ? 'jpg' : 'png';
+  const pathParts = formatRecorderAiDescribeScreenshotPathParts();
+  const dumpRoot = resolve(
+    getMidsceneRunSubDir('dump'),
+    RECORDER_AI_DESCRIBE_SCREENSHOT_DUMP_DIR,
+  );
+  const dumpDir = assertPathInsideDirectory(
+    dumpRoot,
+    join(dumpRoot, pathParts.datePart, pathParts.hourPart),
+  );
+  mkdirSync(dumpDir, { recursive: true });
+  const safeSuffix = suffix === 'annotated' ? 'annotated' : 'raw';
+  const fileName = `${pathParts.filePrefix}_${safeSuffix}.${extension}`;
+  const filePath = assertPathInsideDirectory(dumpRoot, join(dumpDir, fileName));
+  if (!existsSync(filePath)) {
+    writeFileSync(filePath, bytes);
+  }
+
+  return {
+    path: filePath,
+    sha256,
+    bytes: bytes.byteLength,
+    mimeType,
+  };
+}
+
+function getRecorderScreenshotAssetRoot() {
+  const root = resolve(
+    getMidsceneRunSubDir('output'),
+    RECORDER_SCREENSHOT_ASSET_DIR,
+  );
+  mkdirSync(root, { recursive: true });
+  return root;
+}
+
+function assertRecorderScreenshotAssetId(assetId: string) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(assetId)) {
+    throw new Error('Invalid recorder screenshot asset id');
+  }
+  return assetId;
+}
+
+function recorderScreenshotAssetExtension(mimeType?: string) {
+  return mimeType?.includes('jpeg') ? 'jpg' : 'png';
+}
+
+function recorderScreenshotAssetPath(assetId: string, mimeType?: string) {
+  const root = getRecorderScreenshotAssetRoot();
+  const safeAssetId = assertRecorderScreenshotAssetId(assetId);
+  return assertPathInsideDirectory(
+    root,
+    join(root, `${safeAssetId}.${recorderScreenshotAssetExtension(mimeType)}`),
+  );
+}
+
+function getRecorderScreenshotAssetUsage(sessionId: string) {
+  initializeRecorderScreenshotAssetUsage();
+  const safeSessionId = sanitizeRecorderPathSegment(sessionId, 'session');
+  const sessionBytes =
+    recorderScreenshotAssetBytesBySession.get(safeSessionId) || 0;
+  const totalBytes = Array.from(
+    recorderScreenshotAssetBytesBySession.values(),
+  ).reduce((total, bytes) => total + bytes, 0);
+  return { totalBytes, sessionBytes };
+}
+
+function initializeRecorderScreenshotAssetUsage() {
+  if (recorderScreenshotAssetUsageInitialized) {
+    return;
+  }
+  recorderScreenshotAssetUsageInitialized = true;
+  const root = getRecorderScreenshotAssetRoot();
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const match = entry.name.match(
+        /^(.*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:png|jpg)$/i,
+      );
+      if (!match?.[1]) {
+        continue;
+      }
+      const sessionId = match[1];
+      const bytes = statSync(join(root, entry.name)).size;
+      recorderScreenshotAssetBytesBySession.set(
+        sessionId,
+        (recorderScreenshotAssetBytesBySession.get(sessionId) || 0) + bytes,
+      );
+    }
+  } catch (error) {
+    debugRecorderAssets(
+      'failed to initialize recorder screenshot asset usage:',
+      error,
+    );
+  }
+}
+
+function persistRecorderScreenshotAsset(
+  sessionId: string,
+  imageBase64?: string,
+): MidsceneRecorderScreenshotAssetRef | undefined {
+  if (!imageBase64?.startsWith('data:')) {
+    return undefined;
+  }
+  const { base64, mimeType } = extractBase64Payload(imageBase64);
+  const bytes = Buffer.from(base64, 'base64');
+  const safeSessionId = sanitizeRecorderPathSegment(sessionId, 'session');
+  const usage = getRecorderScreenshotAssetUsage(sessionId);
+  if (
+    usage.sessionBytes + bytes.byteLength >
+      RECORDER_SCREENSHOT_ASSET_MAX_SESSION_BYTES ||
+    usage.totalBytes + bytes.byteLength >
+      RECORDER_SCREENSHOT_ASSET_MAX_TOTAL_BYTES
+  ) {
+    if (!recorderScreenshotAssetQuotaExceededSessions.has(safeSessionId)) {
+      recorderScreenshotAssetQuotaExceededSessions.add(safeSessionId);
+      debugRecorderAssets('recorder screenshot asset quota reached %o', {
+        sessionId: safeSessionId,
+        sessionBytes: usage.sessionBytes,
+        totalBytes: usage.totalBytes,
+      });
+    }
+    return undefined;
+  }
+  const assetId = `${safeSessionId}-${randomUUID()}`;
+  const normalizedMimeType = mimeType || 'image/png';
+  const filePath = recorderScreenshotAssetPath(assetId, normalizedMimeType);
+  try {
+    writeFileSync(filePath, bytes);
+  } catch (error) {
+    debugRecorderAssets('failed to persist recorder screenshot asset:', error);
+    return undefined;
+  }
+  recorderScreenshotAssetBytesBySession.set(
+    safeSessionId,
+    usage.sessionBytes + bytes.byteLength,
+  );
+  return {
+    id: assetId,
+    mimeType: normalizedMimeType,
+    bytes: bytes.byteLength,
+  };
+}
+
+function readRecorderScreenshotAsset(
+  asset: MidsceneRecorderScreenshotAssetRef,
+): string | undefined {
+  const filePath = recorderScreenshotAssetPath(asset.id, asset.mimeType);
+  if (!existsSync(filePath)) {
+    return undefined;
+  }
+  return `data:${asset.mimeType};base64,${readFileSync(filePath).toString('base64')}`;
+}
+
+function findRecorderScreenshotAssetPath(assetId: string) {
+  const safeAssetId = assertRecorderScreenshotAssetId(assetId);
+  const root = getRecorderScreenshotAssetRoot();
+  for (const extension of ['png', 'jpg']) {
+    const filePath = assertPathInsideDirectory(
+      root,
+      join(root, `${safeAssetId}.${extension}`),
+    );
+    if (existsSync(filePath)) {
+      return filePath;
+    }
+  }
+  return undefined;
+}
+
+function removeRecorderScreenshotAssetsForSession(sessionId: string) {
+  const safeSessionId = sanitizeRecorderPathSegment(sessionId, 'session');
+  const prefix = `${safeSessionId}-`;
+  const root = getRecorderScreenshotAssetRoot();
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.startsWith(prefix)) {
+      rmSync(join(root, entry.name), { force: true });
+    }
+  }
+  recorderScreenshotAssetQuotaExceededSessions.delete(safeSessionId);
+  recorderScreenshotAssetBytesBySession.delete(safeSessionId);
+}
+
+function pruneRecorderScreenshotAssetsForSession(
+  sessionId: string,
+  retainedAssetIds: string[],
+) {
+  const safeSessionId = sanitizeRecorderPathSegment(sessionId, 'session');
+  const prefix = `${safeSessionId}-`;
+  const retained = new Set(
+    retainedAssetIds.map((assetId) => {
+      const safeAssetId = assertRecorderScreenshotAssetId(assetId);
+      if (!safeAssetId.startsWith(prefix)) {
+        throw new Error('Recorder screenshot asset does not belong to session');
+      }
+      return safeAssetId;
+    }),
+  );
+  const root = getRecorderScreenshotAssetRoot();
+  let sessionBytes = 0;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.startsWith(prefix)) {
+      continue;
+    }
+    const assetId = entry.name.replace(/\.(?:png|jpg)$/i, '');
+    const filePath = join(root, entry.name);
+    if (!retained.has(assetId)) {
+      rmSync(filePath, { force: true });
+      continue;
+    }
+    sessionBytes += statSync(filePath).size;
+  }
+  recorderScreenshotAssetBytesBySession.set(safeSessionId, sessionBytes);
+}
+
+function calculateRecorderScreenshotAnnotation(
+  event: PlaygroundRecorderEvent,
+  imageSize: { width: number; height: number },
+  verifyResult?: PlaygroundRecorderDescribeTrace['verifyResult'],
+): RecorderAiDescribeScreenshotAnnotation | undefined {
+  const pageWidth = event.pageInfo?.width;
+  const pageHeight = event.pageInfo?.height;
+  const scaleX = pageWidth ? imageSize.width / pageWidth : undefined;
+  const scaleY = pageHeight ? imageSize.height / pageHeight : undefined;
+  const mapX = (value: number) => (scaleX ? value * scaleX : value);
+  const mapY = (value: number) => (scaleY ? value * scaleY : value);
+  const logicalPoint =
+    typeof event.elementRect?.x === 'number' &&
+    typeof event.elementRect?.y === 'number'
+      ? ([event.elementRect.x, event.elementRect.y] as [number, number])
+      : undefined;
+  const locateRect = verifyResult?.rect;
+  const sourceTargetRect =
+    typeof event.elementRect?.left === 'number' &&
+    typeof event.elementRect?.top === 'number' &&
+    typeof event.elementRect?.width === 'number' &&
+    typeof event.elementRect?.height === 'number' &&
+    event.elementRect.width > 0 &&
+    event.elementRect.height > 0
+      ? {
+          left: mapX(event.elementRect.left),
+          top: mapY(event.elementRect.top),
+          width: mapX(event.elementRect.width),
+          height: mapY(event.elementRect.height),
+        }
+      : undefined;
+  if (!logicalPoint && !sourceTargetRect && !locateRect) {
+    return undefined;
+  }
+
+  const screenshotPoint =
+    logicalPoint && scaleX && scaleY
+      ? ([logicalPoint[0] * scaleX, logicalPoint[1] * scaleY] as [
+          number,
+          number,
+        ])
+      : undefined;
+  const pointTargetRect =
+    screenshotPoint && !sourceTargetRect
+      ? {
+          left: Math.max(0, screenshotPoint[0] - 6),
+          top: Math.max(0, screenshotPoint[1] - 6),
+          width: 12,
+          height: 12,
+        }
+      : undefined;
+  const center =
+    verifyResult?.center ||
+    (locateRect
+      ? ([
+          locateRect.left + locateRect.width / 2,
+          locateRect.top + locateRect.height / 2,
+        ] as [number, number])
+      : undefined);
+  const centerDelta =
+    screenshotPoint && center
+      ? {
+          x: center[0] - screenshotPoint[0],
+          y: center[1] - screenshotPoint[1],
+          distance: Math.hypot(
+            center[0] - screenshotPoint[0],
+            center[1] - screenshotPoint[1],
+          ),
+        }
+      : undefined;
+  const distanceOutsideRect =
+    screenshotPoint && locateRect
+      ? (() => {
+          const right = locateRect.left + locateRect.width;
+          const bottom = locateRect.top + locateRect.height;
+          const x =
+            screenshotPoint[0] < locateRect.left
+              ? locateRect.left - screenshotPoint[0]
+              : screenshotPoint[0] > right
+                ? screenshotPoint[0] - right
+                : 0;
+          const y =
+            screenshotPoint[1] < locateRect.top
+              ? locateRect.top - screenshotPoint[1]
+              : screenshotPoint[1] > bottom
+                ? screenshotPoint[1] - bottom
+                : 0;
+          return {
+            x,
+            y,
+            distance: Math.hypot(x, y),
+          };
+        })()
+      : undefined;
+
+  return {
+    inputPoint: screenshotPoint
+      ? { logical: logicalPoint!, screenshot: screenshotPoint }
+      : undefined,
+    sourceTargetRect: sourceTargetRect || pointTargetRect,
+    locateRect,
+    centerDelta,
+    distanceOutsideRect,
+  };
+}
+
+async function persistRecorderAiDescribeScreenshot(
+  event: PlaygroundRecorderEvent,
+  eventScreenshot?: string,
+  verifyResult?: PlaygroundRecorderDescribeTrace['verifyResult'],
+): Promise<
+  | {
+      screenshotRef?: RecorderAiDescribeScreenshotRef;
+      annotatedScreenshotRef?: RecorderAiDescribeScreenshotRef;
+      screenshotAnnotation?: RecorderAiDescribeScreenshotAnnotation;
+      annotatedScreenshotPersistError?: string;
+    }
+  | undefined
+> {
+  if (!eventScreenshot) {
+    return undefined;
+  }
+
+  const screenshotRef = writeRecorderAiDescribeScreenshot(
+    eventScreenshot,
+    'raw',
+  );
+  let annotatedScreenshotRef: RecorderAiDescribeScreenshotRef | undefined;
+  let screenshotAnnotation: RecorderAiDescribeScreenshotAnnotation | undefined;
+  let annotatedScreenshotPersistError: string | undefined;
+
+  try {
+    const imageSize = await imageInfoOfBase64(eventScreenshot);
+    screenshotAnnotation = calculateRecorderScreenshotAnnotation(
+      event,
+      imageSize,
+      verifyResult,
+    );
+
+    const annotatedRects = [
+      screenshotAnnotation?.sourceTargetRect,
+      screenshotAnnotation?.locateRect,
+    ].filter((rect): rect is NonNullable<typeof rect> => Boolean(rect));
+
+    if (annotatedRects.length > 0) {
+      const annotatedScreenshot = await annotateRects(
+        eventScreenshot,
+        annotatedRects,
+      );
+      annotatedScreenshotRef = writeRecorderAiDescribeScreenshot(
+        annotatedScreenshot,
+        'annotated',
+      );
+    }
+  } catch (error) {
+    annotatedScreenshotPersistError =
+      error instanceof Error ? error.message : String(error);
+  }
+
+  return {
+    screenshotRef,
+    annotatedScreenshotRef,
+    screenshotAnnotation,
+    annotatedScreenshotPersistError,
+  };
+}
+
+function createRecorderAiDescribeTraceBase(
+  event: PlaygroundRecorderEvent,
+  eventScreenshot?: string,
+): Omit<
+  PlaygroundRecorderDescribeTrace,
+  'status' | 'durationMs' | 'startedAt'
+> {
+  return {
+    traceId: `${event.hashId || 'recorder-event'}-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`,
+    eventHashId: event.hashId,
+    eventType: event.type,
+    actionType: event.actionType,
+    eventSummary: buildRecorderEventSummary(event),
+    point:
+      typeof event.elementRect?.x === 'number' &&
+      typeof event.elementRect?.y === 'number'
+        ? [event.elementRect.x, event.elementRect.y]
+        : undefined,
+    pageInfo: event.pageInfo,
+    screenshotBytes: estimateBase64Bytes(eventScreenshot),
+  };
+}
+
+/** Default `127.0.0.1`. Override via `MIDSCENE_PLAYGROUND_HOST` (e.g. `0.0.0.0`). */
+export function resolvePlaygroundListenHost(): string {
+  return process.env.MIDSCENE_PLAYGROUND_HOST?.trim() || '127.0.0.1';
+}
+
+export function resolvePlaygroundBrowserHost(): string {
+  const listenHost = resolvePlaygroundListenHost();
+  return listenHost === '0.0.0.0' || listenHost === '::'
+    ? '127.0.0.1'
+    : listenHost;
+}
+
+export function buildPlaygroundBrowserUrl(host: string, port: number): string {
+  const normalizedHost =
+    host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${normalizedHost}:${port}`;
+}
 
 function serializeAiConfigSignature(aiConfig: Record<string, unknown>): string {
   return JSON.stringify(
@@ -128,6 +859,11 @@ const STATIC_PATH = join(__dirname, '..', '..', 'static');
 const debugScreenshot = getDebug('playground:screenshot', { console: true });
 const debugMjpeg = getDebug('playground:mjpeg', { console: true });
 const debugInteract = getDebug('playground:interact', { console: true });
+const debugCancel = getDebug('playground:cancel', { console: true });
+const debugReport = getDebug('playground:report', { console: true });
+const debugRecorderAssets = getDebug('playground:recorder-assets', {
+  console: true,
+});
 
 /**
  * Thrown when a caller supplies an /interact body that fails validation
@@ -331,6 +1067,109 @@ export function buildInteractParams(
   return passthrough;
 }
 
+function getRecorderSemanticActionType(
+  actionType: string,
+): MidsceneRecorderSemanticAction['type'] {
+  switch (actionType) {
+    case 'Tap':
+    case 'DoubleClick':
+    case 'LongPress':
+    case 'RightClick':
+      return 'click';
+    case 'Swipe':
+    case 'DragAndDrop':
+      return 'drag';
+    case 'Input':
+      return 'input';
+    case 'KeyboardPress':
+      return 'keydown';
+    case 'Scroll':
+      return 'scroll';
+    case 'GoBack':
+    case 'GoForward':
+    case 'Reload':
+    case 'Stop':
+    case 'Navigate':
+    case 'InitialNavigation':
+    case 'NavigationChanged':
+      return 'navigation';
+    default:
+      return 'click';
+  }
+}
+
+function buildRecorderSemanticAction(
+  actionType: string,
+  payload: Record<string, unknown>,
+  url?: string,
+): MidsceneRecorderSemanticAction {
+  return {
+    type: getRecorderSemanticActionType(actionType),
+    actionType,
+    value:
+      typeof payload.value === 'string'
+        ? payload.value
+        : typeof payload.keyName === 'string'
+          ? payload.keyName
+          : undefined,
+    url,
+  };
+}
+
+function buildReadyRecorderSemantic(
+  source: MidsceneRecorderSemantic['source'],
+  event: MidsceneRecorderSemanticAction,
+  elementDescription: string,
+  confidence: MidsceneRecorderSemantic['confidence'],
+  extra?: Pick<MidsceneRecorderSemantic, 'aiDescribe' | 'error'>,
+): MidsceneRecorderSemantic {
+  return {
+    source,
+    status: 'ready',
+    elementDescription,
+    replayInstruction: buildMidsceneRecorderReplayInstruction(
+      event,
+      elementDescription,
+    ),
+    actionSummary: buildMidsceneRecorderActionSummary(
+      event,
+      elementDescription,
+    ),
+    confidence,
+    ...extra,
+  };
+}
+
+function buildFailedAiDescribeRecorderSemantic(
+  error: unknown,
+  extra?: Pick<MidsceneRecorderSemantic, 'aiDescribe'>,
+): MidsceneRecorderSemantic {
+  return {
+    source: 'aiDescribe',
+    status: 'failed',
+    error: error instanceof Error ? error.message : String(error),
+    ...extra,
+  };
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(message));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
+}
+
 export function createManualExecutorContext(
   actionType: string,
   param: unknown,
@@ -374,6 +1213,8 @@ interface PlaygroundActiveConnection {
   runtime?: PlaygroundRuntimeState;
   executionHooks?: PlaygroundExecutionHooks;
   sidecars?: PlaygroundSidecar[];
+  subscribeNavigationEvents?: PlaygroundSessionNavigationSubscriber;
+  unsubscribeNavigationEvents?: () => void;
 }
 
 interface PlaygroundRecorderPageState {
@@ -390,15 +1231,32 @@ interface PlaygroundRecorderSnapshot {
   pageState: PlaygroundRecorderPageState;
 }
 
+interface PlaygroundRecorderTargetPoint {
+  x: number;
+  y: number;
+}
+
+type PlaygroundDescribeElementVerifyResult = {
+  pass?: boolean;
+  rect?: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+  center?: [number, number];
+  centerDistance?: number;
+  includedInRect?: boolean;
+};
+
+type PlaygroundDescribeElementProgress = {
+  prompt?: string;
+  deepLocate?: boolean;
+  verifyResult?: PlaygroundDescribeElementVerifyResult;
+};
+
 const RECOVERABLE_PAGE_SESSION_ERROR_PATTERN =
   /Session closed|page has been closed|target closed|browser has been closed|Target page, context or browser has been closed/i;
-
-const BROWSER_CHROME_NAVIGATION_ACTIONS = new Set([
-  'GoBack',
-  'GoForward',
-  'Reload',
-  'Stop',
-]);
 
 function isRecoverablePageSessionError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -413,6 +1271,14 @@ class PlaygroundServer {
   staticPath: string;
   taskExecutionDumps: Record<string, ExecutionDump | null>; // Store execution dumps directly
   id: string; // Unique identifier for this server instance
+  private readonly reportFiles = new Map<
+    string,
+    {
+      path: string;
+      expiresAt: number;
+      format: PlaygroundReportRef['format'];
+    }
+  >();
 
   /**
    * Port for scrcpy server (used by Android playground for screen mirroring)
@@ -442,6 +1308,7 @@ class PlaygroundServer {
 
   // Track current running task
   private currentTaskId: string | null = null;
+  private taskAbortControllers: Record<string, AbortController> = {};
 
   // Flag to pause MJPEG polling during agent recreation or task execution
   private _agentReady = true;
@@ -455,6 +1322,15 @@ class PlaygroundServer {
   private _baseSidecars?: PlaygroundSidecar[];
   private _recorderSessionId: string | null = null;
   private _recorderEvents: PlaygroundRecorderEvent[] = [];
+  private _recorderPendingTypeOnlyInput: PlaygroundRecorderEvent | null = null;
+  private _recorderPendingTypeOnlyInputFlushTimer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
+  private _recorderEventQueue: Promise<void> = Promise.resolve();
+  private _recorderPendingCaptures = 0;
+  private _studioPreviewRecorderLastTargetPoint:
+    | PlaygroundRecorderTargetPoint
+    | undefined;
   private _studioPreviewRecorderLastScreenshot: string | undefined;
   private _studioPreviewRecorderLastPageState:
     | PlaygroundRecorderPageState
@@ -564,6 +1440,7 @@ class PlaygroundServer {
   }
 
   private restoreBaseSessionState(): void {
+    this.clearActiveSessionNavigationEvents();
     this.taskExecutionDumps = {};
     this.currentTaskId = null;
     this.sessionSetupState =
@@ -763,10 +1640,22 @@ class PlaygroundServer {
   }
 
   private resetRecorderState(): void {
+    this.clearPendingTypeOnlyRecorderInputFlushTimer();
     this._recorderSessionId = null;
     this._recorderEvents = [];
+    this._recorderPendingTypeOnlyInput = null;
+    this._recorderEventQueue = Promise.resolve();
+    this._studioPreviewRecorderLastTargetPoint = undefined;
     this._studioPreviewRecorderLastScreenshot = undefined;
     this._studioPreviewRecorderLastPageState = undefined;
+  }
+
+  async waitForRecorderIdle(): Promise<void> {
+    await this.waitForQueuedRecorderEvents();
+  }
+
+  private async waitForQueuedRecorderEvents(): Promise<void> {
+    await this._recorderEventQueue;
   }
 
   private canRecordStudioPreviewInteractions(): boolean {
@@ -873,6 +1762,24 @@ class PlaygroundServer {
     };
   }
 
+  private captureCachedRecorderSnapshotBeforeInteract():
+    | PlaygroundRecorderSnapshot
+    | undefined {
+    if (
+      !this._recorderSessionId ||
+      !this._studioPreviewRecorderLastPageState ||
+      this._recorderPendingCaptures > 0
+    ) {
+      return undefined;
+    }
+    return {
+      screenshot:
+        this._mjpegHandler.getLastFrameBase64() ||
+        this._studioPreviewRecorderLastScreenshot,
+      pageState: this._studioPreviewRecorderLastPageState,
+    };
+  }
+
   private async startStudioPreviewRecorder(sessionId: string): Promise<void> {
     this._recorderSessionId = sessionId;
     this._studioPreviewRecorderLastScreenshot =
@@ -889,9 +1796,19 @@ class PlaygroundServer {
     }
   }
 
+  private persistStudioPreviewRecorderScreenshot(
+    screenshot?: string,
+  ): MidsceneRecorderScreenshotAssetRef | undefined {
+    if (!this._recorderSessionId) {
+      return undefined;
+    }
+    return persistRecorderScreenshotAsset(this._recorderSessionId, screenshot);
+  }
+
   private async storeStudioPreviewRecorderEvent(
     payload: Record<string, unknown>,
     snapshotBefore?: PlaygroundRecorderSnapshot,
+    agent?: PageAgent,
   ): Promise<void> {
     if (!this._recorderSessionId) {
       return;
@@ -928,18 +1845,14 @@ class PlaygroundServer {
       return;
     }
 
-    this._recorderEvents.push(event);
-    const navigationEvent = this.buildStudioPreviewNavigationChangeEvent(
+    const navigationEvent = this.buildStudioPreviewNavigationStateEvent(
       payload,
-      before?.pageState,
+      this.getRecorderNavigationPageStateBefore(before?.pageState),
       pageStateAfter,
-      screenshotAfter,
     );
-    if (navigationEvent) {
-      this._recorderEvents.push(navigationEvent);
-    }
     this._studioPreviewRecorderLastScreenshot = screenshotAfter;
     this._studioPreviewRecorderLastPageState = pageStateAfter;
+    this.queueStudioPreviewRecorderEventAppend(event, navigationEvent);
   }
 
   private async buildStudioPreviewRecorderEvent(
@@ -954,8 +1867,23 @@ class PlaygroundServer {
 
     const { pageInfo, url, title } = pageState;
     const timestamp = Date.now();
-    const x = typeof payload.x === 'number' ? payload.x : undefined;
-    const y = typeof payload.y === 'number' ? payload.y : undefined;
+    const payloadX = typeof payload.x === 'number' ? payload.x : undefined;
+    const payloadY = typeof payload.y === 'number' ? payload.y : undefined;
+    const canReuseLastTargetPoint =
+      actionType === 'Input' || actionType === 'KeyboardPress';
+    const inheritedTargetPoint =
+      canReuseLastTargetPoint &&
+      (payloadX === undefined || payloadY === undefined)
+        ? this._studioPreviewRecorderLastTargetPoint
+        : undefined;
+    const x = payloadX ?? inheritedTargetPoint?.x;
+    const y = payloadY ?? inheritedTargetPoint?.y;
+    if (payloadX !== undefined && payloadY !== undefined) {
+      this._studioPreviewRecorderLastTargetPoint = {
+        x: payloadX,
+        y: payloadY,
+      };
+    }
     const endX = typeof payload.endX === 'number' ? payload.endX : undefined;
     const endY = typeof payload.endY === 'number' ? payload.endY : undefined;
     const dragDescription =
@@ -965,14 +1893,24 @@ class PlaygroundServer {
       endY !== undefined
         ? `${Math.round(x)},${Math.round(y)} -> ${Math.round(endX)},${Math.round(endY)}`
         : undefined;
-    const screenshotWithMarker =
-      x !== undefined && y !== undefined
-        ? await this.createRecorderScreenshotWithMarker(
-            screenshotBefore || screenshotAfter,
-            pageInfo,
-            { x, y },
-          )
-        : undefined;
+    const shouldPersistScreenshot =
+      shouldPersistStudioPreviewRecorderScreenshot(actionType);
+    const retainedScreenshot = shouldPersistScreenshot
+      ? screenshotBefore || screenshotAfter
+      : undefined;
+    const deferScreenshotPersistence =
+      actionType === 'Input' && payload.mode === 'typeOnly';
+    const screenshotAsset = deferScreenshotPersistence
+      ? undefined
+      : this.persistStudioPreviewRecorderScreenshot(retainedScreenshot);
+    const shouldDiscardDataUrlScreenshot = Boolean(
+      retainedScreenshot?.startsWith('data:'),
+    );
+    const hasRetainedScreenshot = Boolean(
+      screenshotAsset ||
+        (deferScreenshotPersistence && retainedScreenshot) ||
+        (!shouldDiscardDataUrlScreenshot && retainedScreenshot),
+    );
 
     const base = {
       source: 'studio-preview' as const,
@@ -981,11 +1919,26 @@ class PlaygroundServer {
       pageInfo,
       url,
       title,
-      screenshotBefore,
-      screenshotAfter,
-      screenshotWithBox: screenshotWithMarker,
-      descriptionLoading: true,
-      descriptionSource: undefined,
+      ...(screenshotAsset
+        ? { screenshotAsset }
+        : deferScreenshotPersistence
+          ? retainedScreenshot
+            ? { screenshotWithBox: retainedScreenshot }
+            : {}
+          : shouldDiscardDataUrlScreenshot
+            ? {}
+            : {
+                screenshotBefore,
+                screenshotAfter,
+              }),
+      semantic: hasRetainedScreenshot
+        ? {
+            source: 'aiDescribe' as const,
+            status: 'pending' as const,
+          }
+        : buildFailedAiDescribeRecorderSemantic(
+            'Recorder screenshot was not retained because asset storage is unavailable or its quota was reached.',
+          ),
       timestamp,
       hashId: `studio-preview-${actionType}-${timestamp}-${Math.random()
         .toString(36)
@@ -1063,28 +2016,25 @@ class PlaygroundServer {
       case 'GoBack':
       case 'GoForward':
       case 'Reload':
-      case 'Stop':
+      case 'Stop': {
+        const elementDescription = url || actionType;
+        const semanticEvent = buildRecorderSemanticAction(
+          actionType,
+          { value: actionType },
+          url,
+        );
         return {
           ...base,
           type: 'navigation',
           value: actionType,
-          elementDescription: url || actionType,
-          replayInstruction:
-            actionType === 'Stop'
-              ? 'Stop loading the current page.'
-              : url
-                ? `Wait for navigation to complete at \`${url}\`.`
-                : `${actionType} in the browser.`,
-          actionSummary:
-            actionType === 'Stop'
-              ? 'Stop page loading'
-              : url
-                ? `${actionType} to ${url}`
-                : actionType,
-          semanticConfidence: url ? 'high' : 'medium',
-          descriptionLoading: false,
-          descriptionSource: 'fallback',
+          semantic: buildReadyRecorderSemantic(
+            'heuristic',
+            semanticEvent,
+            elementDescription,
+            url ? 'high' : 'medium',
+          ),
         };
+      }
       default:
         return {
           ...base,
@@ -1097,50 +2047,594 @@ class PlaygroundServer {
     }
   }
 
-  private buildStudioPreviewNavigationChangeEvent(
+  private async enrichStudioPreviewRecorderEventWithAiDescribe(
+    event: PlaygroundRecorderEvent,
+    agent?: PageAgent,
+  ): Promise<{
+    event: PlaygroundRecorderEvent;
+    trace: PlaygroundRecorderDescribeTrace;
+  }> {
+    const startedAt = new Date();
+    const startedAtMs = Date.now();
+    const eventScreenshot = await this.getRecorderAiDescribeScreenshot(event);
+    const traceBase = createRecorderAiDescribeTraceBase(event, eventScreenshot);
+    const finishTrace = async (
+      status: PlaygroundRecorderDescribeTrace['status'],
+      extra: Partial<PlaygroundRecorderDescribeTrace> = {},
+    ): Promise<PlaygroundRecorderDescribeTrace> => {
+      let screenshotRef:
+        | NonNullable<PlaygroundRecorderDescribeTrace['screenshotRef']>
+        | undefined;
+      let annotatedScreenshotRef:
+        | NonNullable<PlaygroundRecorderDescribeTrace['annotatedScreenshotRef']>
+        | undefined;
+      let screenshotAnnotation:
+        | NonNullable<PlaygroundRecorderDescribeTrace['screenshotAnnotation']>
+        | undefined;
+      let screenshotPersistError: string | undefined;
+      let annotatedScreenshotPersistError: string | undefined;
+
+      if (status === 'failed' || extra.verifyResult?.pass === false) {
+        try {
+          const screenshotDump = await persistRecorderAiDescribeScreenshot(
+            event,
+            eventScreenshot,
+            extra.verifyResult,
+          );
+          screenshotRef = screenshotDump?.screenshotRef;
+          annotatedScreenshotRef = screenshotDump?.annotatedScreenshotRef;
+          screenshotAnnotation = screenshotDump?.screenshotAnnotation;
+          annotatedScreenshotPersistError =
+            screenshotDump?.annotatedScreenshotPersistError;
+        } catch (error) {
+          screenshotPersistError =
+            error instanceof Error ? error.message : String(error);
+        }
+      }
+
+      return {
+        ...traceBase,
+        ...extra,
+        screenshotRef,
+        annotatedScreenshotRef,
+        screenshotAnnotation,
+        screenshotPersistError,
+        annotatedScreenshotPersistError,
+        status,
+        startedAt: startedAt.toISOString(),
+        durationMs: Date.now() - startedAtMs,
+      };
+    };
+    if (event.type === 'navigation' || event.type === 'setViewport') {
+      const error =
+        'aiDescribe skipped because the event type does not target a UI element.';
+      const trace = await finishTrace('failed', { error });
+      debugInteract('recorder aiDescribe trace:', trace);
+      return {
+        event: {
+          ...event,
+          semantic: buildFailedAiDescribeRecorderSemantic(error),
+        },
+        trace,
+      };
+    }
+    if (!agent) {
+      const error = 'Active agent does not support describeElementAtPoint.';
+      const trace = await finishTrace('failed', { error });
+      debugInteract('recorder aiDescribe trace:', trace);
+      return {
+        event: {
+          ...event,
+          semantic: buildFailedAiDescribeRecorderSemantic(error),
+        },
+        trace,
+      };
+    }
+
+    const x = event.elementRect?.x;
+    const y = event.elementRect?.y;
+    let modelCallDurationMs: number | undefined;
+    let modelCallStartedAt: number | undefined;
+    let elementDescription: string | undefined;
+    let deepLocate: boolean | undefined;
+    let verifyResult:
+      | AgentDescribeElementAtPointResult['verifyResult']
+      | PlaygroundDescribeElementVerifyResult
+      | undefined;
+    const verifyPrompt = RECORDER_AI_DESCRIBE_VERIFY_PROMPT;
+    try {
+      if (typeof x !== 'number' || typeof y !== 'number') {
+        throw new Error(
+          'Skipped aiDescribe because the recorder event has no stable point target.',
+        );
+      }
+      if (!eventScreenshot) {
+        throw new Error(
+          'Skipped aiDescribe because the recorder event has no screenshot.',
+        );
+      }
+      if (!event.pageInfo?.width || !event.pageInfo?.height) {
+        throw new Error(
+          'Skipped aiDescribe because the recorder event has no pageInfo for coordinate mapping.',
+        );
+      }
+      modelCallStartedAt = Date.now();
+      const elementDescriber = createElementDescriberRuntime(agent);
+      /**
+       * Verification is disabled for recorder aiDescribe because it took too long and caused timeouts.
+       */
+      const describeResult = await withTimeout(
+        describeElementAtPoint(elementDescriber, [x, y], {
+          verifyPrompt,
+          screenshotBase64: eventScreenshot,
+          coordinateSpace: 'logical',
+          logicalSize: event.pageInfo,
+          onProgress: (progress) => {
+            elementDescription = progress.prompt?.trim() || elementDescription;
+            deepLocate = progress.deepLocate;
+            verifyResult = verifyPrompt ? progress.verifyResult : undefined;
+          },
+        }),
+        RECORDER_AI_DESCRIBE_AFTER_INTERACT_TIMEOUT_MS,
+        'Timed out while analyzing recorder event with aiDescribe.',
+      );
+      modelCallDurationMs = Date.now() - modelCallStartedAt;
+      elementDescription = describeResult.prompt?.trim();
+      deepLocate = describeResult.deepLocate;
+      verifyResult = verifyPrompt ? describeResult.verifyResult : undefined;
+      if (!elementDescription) {
+        throw new Error('aiDescribe returned an empty element description.');
+      }
+      const semanticAction = buildRecorderSemanticAction(
+        event.actionType || event.type,
+        event.rawPayload || {},
+        event.url,
+      );
+      if (describeResult.success === false && verifyResult?.pass === false) {
+        const trace = await finishTrace('ready', {
+          modelCallDurationMs,
+          elementDescription,
+          verifyPrompt,
+          verifyPassed: false,
+          centerDistance: verifyResult.centerDistance,
+          verifyResult,
+        });
+        debugInteract('recorder aiDescribe trace:', trace);
+        return {
+          event: {
+            ...event,
+            semantic: buildReadyRecorderSemantic(
+              'aiDescribe',
+              semanticAction,
+              elementDescription,
+              'low',
+              {
+                aiDescribe: {
+                  verifyPrompt,
+                  verifyPassed: false,
+                  deepLocate,
+                  centerDistance: verifyResult.centerDistance,
+                  expectedCenter: [x, y],
+                  actualCenter: verifyResult.center,
+                  annotatedScreenshotPath: trace.annotatedScreenshotRef?.path,
+                },
+              },
+            ),
+          },
+          trace,
+        };
+      }
+      if (describeResult.success === false) {
+        throw new Error(
+          describeResult.error ||
+            `aiDescribe ${describeResult.failureStage || 'unknown'} failed.`,
+        );
+      }
+      const trace = await finishTrace('ready', {
+        modelCallDurationMs,
+        elementDescription,
+        verifyPrompt,
+        verifyPassed: verifyResult?.pass,
+        centerDistance: verifyResult?.centerDistance,
+        verifyResult,
+      });
+      debugInteract('recorder aiDescribe trace:', trace);
+      return {
+        event: {
+          ...event,
+          semantic: buildReadyRecorderSemantic(
+            'aiDescribe',
+            semanticAction,
+            elementDescription,
+            verifyResult?.pass ? 'high' : 'medium',
+            {
+              aiDescribe: {
+                verifyPrompt,
+                verifyPassed: verifyResult?.pass,
+                deepLocate,
+                centerDistance: verifyResult?.centerDistance,
+                expectedCenter: [x, y],
+                actualCenter: verifyResult?.center,
+                annotatedScreenshotPath: trace.annotatedScreenshotRef?.path,
+              },
+            },
+          ),
+        },
+        trace,
+      };
+    } catch (error) {
+      const reportedError =
+        verifyResult?.pass === false
+          ? new Error('aiDescribe verification failed.')
+          : error;
+      if (modelCallDurationMs === undefined && modelCallStartedAt) {
+        modelCallDurationMs = Date.now() - modelCallStartedAt;
+      }
+      debugInteract('canonical recorder aiDescribe failed:', reportedError);
+      const trace = await finishTrace('failed', {
+        error:
+          reportedError instanceof Error
+            ? reportedError.message
+            : String(reportedError),
+        modelCallDurationMs,
+        elementDescription,
+        verifyPrompt,
+        verifyPassed: verifyResult?.pass,
+        centerDistance: verifyResult?.centerDistance,
+        verifyResult,
+      });
+      debugInteract('recorder aiDescribe trace:', trace);
+      const aiDescribeDetails =
+        verifyPrompt && (verifyResult || trace.annotatedScreenshotRef)
+          ? {
+              aiDescribe: {
+                verifyPrompt,
+                verifyPassed: verifyResult?.pass,
+                deepLocate,
+                centerDistance: verifyResult?.centerDistance,
+                expectedCenter:
+                  typeof x === 'number' && typeof y === 'number'
+                    ? ([x, y] as [number, number])
+                    : undefined,
+                actualCenter: verifyResult?.center,
+                annotatedScreenshotPath: trace.annotatedScreenshotRef?.path,
+              },
+            }
+          : undefined;
+      return {
+        event: {
+          ...event,
+          semantic: buildFailedAiDescribeRecorderSemantic(
+            reportedError,
+            aiDescribeDetails,
+          ),
+        },
+        trace,
+      };
+    }
+  }
+
+  private async getRecorderAiDescribeScreenshot(
+    event: PlaygroundRecorderEvent,
+  ): Promise<string | undefined> {
+    if (event.screenshotAsset) {
+      const screenshot = readRecorderScreenshotAsset(event.screenshotAsset);
+      if (screenshot) {
+        return screenshot;
+      }
+    }
+    if (
+      event.type === 'click' ||
+      event.type === 'input' ||
+      event.type === 'keydown' ||
+      event.type === 'drag'
+    ) {
+      return event.screenshotBefore || event.screenshotAfter;
+    }
+    return (
+      event.screenshotAfter || event.screenshotBefore || event.screenshotWithBox
+    );
+  }
+
+  private queueStudioPreviewRecorderEventAppend(
+    event: PlaygroundRecorderEvent,
+    navigationEvent: PlaygroundRecorderEvent | null,
+  ): void {
+    const sessionId = this._recorderSessionId;
+    if (!sessionId) {
+      return;
+    }
+
+    if (this.isDeferredTypeOnlyRecorderInput(event) && !navigationEvent) {
+      const pending = this._recorderPendingTypeOnlyInput;
+      if (
+        pending &&
+        this.canCoalesceDeferredTypeOnlyRecorderInput(pending, event)
+      ) {
+        this._recorderPendingTypeOnlyInput =
+          this.mergeDeferredTypeOnlyRecorderInput(pending, event);
+      } else {
+        this.flushPendingTypeOnlyRecorderInput();
+        this._recorderPendingTypeOnlyInput = event;
+      }
+      this.schedulePendingTypeOnlyRecorderInputFlush();
+      return;
+    }
+
+    this.flushPendingTypeOnlyRecorderInput();
+    this._recorderEvents.push(event);
+    if (navigationEvent) {
+      this._recorderEvents.push(navigationEvent);
+    }
+  }
+
+  private isDeferredTypeOnlyRecorderInput(event: PlaygroundRecorderEvent) {
+    return (
+      event.source === 'studio-preview' &&
+      event.type === 'input' &&
+      event.actionType === 'Input' &&
+      event.rawPayload?.mode === 'typeOnly'
+    );
+  }
+
+  private canCoalesceDeferredTypeOnlyRecorderInput(
+    current: PlaygroundRecorderEvent,
+    next: PlaygroundRecorderEvent,
+  ) {
+    return (
+      current.url === next.url &&
+      current.title === next.title &&
+      current.rawPayload?.x === next.rawPayload?.x &&
+      current.rawPayload?.y === next.rawPayload?.y
+    );
+  }
+
+  private mergeDeferredTypeOnlyRecorderInput(
+    current: PlaygroundRecorderEvent,
+    next: PlaygroundRecorderEvent,
+  ): PlaygroundRecorderEvent {
+    const value = `${current.value || ''}${next.value || ''}`;
+    return {
+      ...current,
+      value,
+      rawPayload: {
+        ...current.rawPayload,
+        ...next.rawPayload,
+        value,
+      },
+      pageInfo: next.pageInfo || current.pageInfo,
+      screenshotWithBox:
+        next.screenshotWithBox ||
+        next.screenshotAfter ||
+        next.screenshotBefore ||
+        current.screenshotWithBox,
+      timestamp: next.timestamp,
+      mergedHashIds: Array.from(
+        new Set([
+          current.hashId,
+          ...(current.mergedHashIds || []),
+          next.hashId,
+          ...(next.mergedHashIds || []),
+        ]),
+      ),
+    };
+  }
+
+  private flushPendingTypeOnlyRecorderInput(): void {
+    this.clearPendingTypeOnlyRecorderInputFlushTimer();
+    const pending = this._recorderPendingTypeOnlyInput;
+    if (!pending) {
+      return;
+    }
+    this._recorderPendingTypeOnlyInput = null;
+    const screenshot =
+      pending.screenshotWithBox ||
+      pending.screenshotAfter ||
+      pending.screenshotBefore;
+    const screenshotAsset =
+      this.persistStudioPreviewRecorderScreenshot(screenshot);
+    if (screenshotAsset) {
+      this._recorderEvents.push({
+        ...pending,
+        screenshotAsset,
+        screenshotBefore: undefined,
+        screenshotAfter: undefined,
+        screenshotWithBox: undefined,
+      });
+      return;
+    }
+
+    this._recorderEvents.push({
+      ...pending,
+      screenshotBefore: undefined,
+      screenshotAfter: undefined,
+      screenshotWithBox: undefined,
+      semantic: buildFailedAiDescribeRecorderSemantic(
+        'Recorder screenshot was not retained because asset storage is unavailable or its quota was reached.',
+      ),
+    });
+  }
+
+  private schedulePendingTypeOnlyRecorderInputFlush(): void {
+    this.clearPendingTypeOnlyRecorderInputFlushTimer();
+    this._recorderPendingTypeOnlyInputFlushTimer = setTimeout(() => {
+      this._recorderPendingTypeOnlyInputFlushTimer = undefined;
+      this.flushPendingTypeOnlyRecorderInput();
+    }, RECORDER_TYPE_ONLY_INPUT_SETTLE_DELAY_MS);
+  }
+
+  private clearPendingTypeOnlyRecorderInputFlushTimer(): void {
+    if (!this._recorderPendingTypeOnlyInputFlushTimer) {
+      return;
+    }
+    clearTimeout(this._recorderPendingTypeOnlyInputFlushTimer);
+    this._recorderPendingTypeOnlyInputFlushTimer = undefined;
+  }
+
+  private getRecorderNavigationPageStateBefore(
+    snapshotPageState: PlaygroundRecorderPageState | undefined,
+  ): PlaygroundRecorderPageState | undefined {
+    const lastPageState = this._studioPreviewRecorderLastPageState;
+    if (
+      !snapshotPageState?.url ||
+      !lastPageState?.url ||
+      snapshotPageState.url === lastPageState.url
+    ) {
+      return snapshotPageState;
+    }
+    return lastPageState;
+  }
+
+  private buildStudioPreviewNavigationStateEvent(
     payload: Record<string, unknown>,
     pageStateBefore: PlaygroundRecorderPageState | undefined,
     pageStateAfter: PlaygroundRecorderPageState,
-    screenshotAfter?: string,
   ): PlaygroundRecorderEvent | null {
-    const actionType =
+    const triggerActionType =
       typeof payload.actionType === 'string' ? payload.actionType : undefined;
-    if (!actionType || BROWSER_CHROME_NAVIGATION_ACTIONS.has(actionType)) {
-      return null;
-    }
     const beforeUrl = pageStateBefore?.url;
     const afterUrl = pageStateAfter.url;
-    if (!afterUrl || beforeUrl === afterUrl) {
+    if (!triggerActionType || !afterUrl || beforeUrl === afterUrl) {
       return null;
     }
 
     const timestamp = Date.now();
+    const semanticAction = buildRecorderSemanticAction(
+      'Navigate',
+      { value: afterUrl },
+      afterUrl,
+    );
     return {
       source: 'studio-preview',
       type: 'navigation',
-      actionType: 'NavigationChanged',
+      actionType: 'Navigate',
       rawPayload: {
-        triggerActionType: actionType,
+        triggerActionType,
         beforeUrl,
         afterUrl,
+        implicitNavigationState: true,
       },
       pageInfo: pageStateAfter.pageInfo,
       url: afterUrl,
       title: pageStateAfter.title,
       value: afterUrl,
-      screenshotBefore: screenshotAfter,
-      screenshotAfter,
-      elementDescription: afterUrl,
-      replayInstruction: `Wait for navigation to complete at \`${afterUrl}\`.`,
-      actionSummary: `Wait for navigation to complete at ${afterUrl}`,
-      semanticConfidence: 'high',
-      descriptionLoading: false,
-      descriptionSource: 'fallback',
+      semantic: buildReadyRecorderSemantic(
+        'heuristic',
+        semanticAction,
+        afterUrl,
+        'high',
+      ),
       timestamp,
       hashId: `studio-preview-navigation-${timestamp}-${Math.random()
         .toString(36)
         .slice(2, 8)}`,
     };
+  }
+
+  private recordStudioPreviewNavigationState(
+    navigation: PlaygroundSessionNavigationEvent,
+  ): void {
+    const sessionId = this._recorderSessionId;
+    if (!sessionId || !navigation.url) {
+      return;
+    }
+
+    const task = this._recorderEventQueue
+      .catch(() => undefined)
+      .then(() => {
+        if (this._recorderSessionId !== sessionId) {
+          return;
+        }
+        const pageStateBefore = this._studioPreviewRecorderLastPageState;
+        if (pageStateBefore?.url === navigation.url) {
+          return;
+        }
+        const navigationEvent = this.buildStudioPreviewNavigationStateEvent(
+          { actionType: 'SessionNavigation' },
+          pageStateBefore,
+          {
+            pageInfo: pageStateBefore?.pageInfo || { width: 0, height: 0 },
+            url: navigation.url,
+          },
+        );
+        if (!navigationEvent) {
+          return;
+        }
+        navigationEvent.timestamp = navigation.timestamp || Date.now();
+        navigationEvent.rawPayload = {
+          ...navigationEvent.rawPayload,
+          navigationSource: 'session-event',
+        };
+
+        const lastActionIndex = this._recorderEvents.findLastIndex(
+          (event) =>
+            event.source === 'studio-preview' && event.type !== 'navigation',
+        );
+        const existingState =
+          lastActionIndex >= 0
+            ? this._recorderEvents[lastActionIndex + 1]
+            : undefined;
+        if (existingState?.rawPayload?.implicitNavigationState === true) {
+          this._recorderEvents.push({
+            ...navigationEvent,
+            // Keep the same Timeline item while incremental polling receives
+            // this newer URL for the same user action.
+            hashId: existingState.hashId,
+          });
+        } else if (lastActionIndex >= 0) {
+          this._recorderEvents.splice(lastActionIndex + 1, 0, navigationEvent);
+        } else {
+          this._recorderEvents.push(navigationEvent);
+        }
+        this._studioPreviewRecorderLastPageState = {
+          pageInfo: pageStateBefore?.pageInfo || { width: 0, height: 0 },
+          ...(pageStateBefore?.title ? { title: pageStateBefore.title } : {}),
+          url: navigation.url,
+        };
+      });
+
+    this._recorderEventQueue = task.catch((error) => {
+      debugInteract('session navigation recorder event failed:', error);
+    });
+  }
+
+  private queueStudioPreviewRecorderEvent(
+    payload: Record<string, unknown>,
+    snapshotBefore?: PlaygroundRecorderSnapshot,
+    agent?: PageAgent,
+  ): void {
+    const sessionId = this._recorderSessionId;
+    if (!sessionId) {
+      return;
+    }
+
+    this._recorderPendingCaptures++;
+    const queuedTask = this._recorderEventQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          if (
+            !this._recorderSessionId ||
+            this._recorderSessionId !== sessionId
+          ) {
+            return;
+          }
+          await this.storeStudioPreviewRecorderEvent(
+            payload,
+            snapshotBefore,
+            agent,
+          );
+        } finally {
+          this._recorderPendingCaptures = Math.max(
+            0,
+            this._recorderPendingCaptures - 1,
+          );
+        }
+      });
+
+    this._recorderEventQueue = queuedTask.catch((error) => {
+      debugInteract('async recorder event capture failed:', error);
+    });
   }
 
   private buildStudioPreviewInitialNavigationEvent(
@@ -1152,6 +2646,11 @@ class PlaygroundServer {
     }
 
     const timestamp = Date.now();
+    const semanticEvent = buildRecorderSemanticAction(
+      'InitialNavigation',
+      { value: pageState.url },
+      pageState.url,
+    );
     return {
       source: 'studio-preview',
       type: 'navigation',
@@ -1164,39 +2663,17 @@ class PlaygroundServer {
       url: pageState.url,
       title: pageState.title,
       value: pageState.url,
-      screenshotBefore: screenshot,
-      screenshotAfter: screenshot,
-      elementDescription: pageState.url,
-      replayInstruction: `Navigate to \`${pageState.url}\`.`,
-      actionSummary: `Navigate to ${pageState.url}`,
-      semanticConfidence: 'high',
-      descriptionLoading: false,
-      descriptionSource: 'fallback',
+      semantic: buildReadyRecorderSemantic(
+        'heuristic',
+        semanticEvent,
+        pageState.url,
+        'high',
+      ),
       timestamp,
       hashId: `studio-preview-initial-navigation-${timestamp}-${Math.random()
         .toString(36)
         .slice(2, 8)}`,
     };
-  }
-
-  private async createRecorderScreenshotWithMarker(
-    screenshot: string | undefined,
-    pageInfo: { width: number; height: number },
-    point: { x: number; y: number },
-  ): Promise<string | undefined> {
-    if (!screenshot || !pageInfo.width || !pageInfo.height) {
-      return undefined;
-    }
-    try {
-      return await compositePointMarkerImg({
-        inputImgBase64: screenshot,
-        size: pageInfo,
-        point,
-      });
-    } catch (error) {
-      debugScreenshot('recorder screenshot marker failed:', error);
-      return undefined;
-    }
   }
 
   private async destroyCurrentAgent({
@@ -1226,6 +2703,7 @@ class PlaygroundServer {
   private async destroyCurrentSession(): Promise<void> {
     const previousSession = this._activeConnection.session;
     const previousSidecars = this._activeConnection.sidecars;
+    this.clearActiveSessionNavigationEvents();
     await this.destroyCurrentAgent();
     await this.stopSidecars(previousSidecars);
 
@@ -1267,6 +2745,7 @@ class PlaygroundServer {
         },
         executionHooks: session.executionHooks || this._baseExecutionHooks,
         sidecars: sessionSidecars,
+        subscribeNavigationEvents: session.subscribeNavigationEvents,
       };
       this._mjpegHandler.reset();
       this.sessionSetupState = 'ready';
@@ -1276,6 +2755,30 @@ class PlaygroundServer {
       await this.stopSidecars(sessionSidecars).catch(() => {});
       this.restoreBaseSessionState();
       throw error;
+    }
+  }
+
+  private bindActiveSessionNavigationEvents(): void {
+    this.clearActiveSessionNavigationEvents();
+    const subscribe = this._activeConnection.subscribeNavigationEvents;
+    if (!subscribe) {
+      return;
+    }
+    this._activeConnection.unsubscribeNavigationEvents = subscribe((event) => {
+      this.recordStudioPreviewNavigationState(event);
+    });
+  }
+
+  private clearActiveSessionNavigationEvents(): void {
+    const unsubscribe = this._activeConnection.unsubscribeNavigationEvents;
+    this._activeConnection.unsubscribeNavigationEvents = undefined;
+    if (!unsubscribe) {
+      return;
+    }
+    try {
+      unsubscribe();
+    } catch (error) {
+      debugInteract('failed to unsubscribe session navigation events:', error);
     }
   }
 
@@ -1506,6 +3009,56 @@ class PlaygroundServer {
     await action.call(params, createManualExecutorContext(actionType, params));
   }
 
+  private async registerReportFile(
+    reportPath: string | null | undefined,
+  ): Promise<PlaygroundReportRef | null> {
+    if (!reportPath) return null;
+
+    const reportStat = await stat(reportPath);
+    if (!reportStat.isFile()) {
+      throw new Error(`Report path is not a file: ${reportPath}`);
+    }
+
+    const screenshotsPath = join(dirname(reportPath), 'screenshots');
+    const hasExternalScreenshots = await stat(screenshotsPath)
+      .then((entry) => entry.isDirectory())
+      .catch(() => false);
+    const format: PlaygroundReportRef['format'] =
+      basename(reportPath) === 'index.html' && hasExternalScreenshots
+        ? 'html-and-external-assets'
+        : 'single-html';
+
+    const now = Date.now();
+    for (const [id, report] of this.reportFiles) {
+      if (report.expiresAt <= now) this.reportFiles.delete(id);
+    }
+
+    const id = randomUUID();
+    this.reportFiles.set(id, {
+      path: reportPath,
+      expiresAt: now + PLAYGROUND_REPORT_REF_TTL_MS,
+      format,
+    });
+
+    return {
+      id,
+      url: `/reports/${id}/`,
+      replayUrl: `/reports/${id}/replay`,
+      bytes: reportStat.size,
+      format,
+    };
+  }
+
+  private getRegisteredReport(reportId: string) {
+    const report = this.reportFiles.get(reportId);
+    if (!report || report.expiresAt <= Date.now()) {
+      if (report) this.reportFiles.delete(reportId);
+      return null;
+    }
+    report.expiresAt = Date.now() + PLAYGROUND_REPORT_REF_TTL_MS;
+    return report;
+  }
+
   /**
    * Setup all API routes
    */
@@ -1515,6 +3068,94 @@ class PlaygroundServer {
         status: 'ok',
         id: this.id,
       });
+    });
+
+    this._app.get(
+      '/reports/:reportId/replay',
+      async (req: Request, res: Response) => {
+        const report = this.getRegisteredReport(req.params.reportId);
+        if (!report) {
+          return res.status(404).json({ error: 'Report not found or expired' });
+        }
+
+        try {
+          const serializedDump = await extractLastReportDump(report.path);
+          res.setHeader('Cache-Control', 'no-store');
+          return res.type('json').send(serializedDump);
+        } catch (error) {
+          debugReport('failed to stream report replay: %s', error);
+          return res
+            .status(500)
+            .json({ error: 'Failed to load report replay' });
+        }
+      },
+    );
+
+    this._app.get(
+      '/reports/:reportId/screenshots/:assetName',
+      async (req: Request, res: Response) => {
+        const report = this.getRegisteredReport(req.params.reportId);
+        if (!report) {
+          return res.status(404).json({ error: 'Report not found or expired' });
+        }
+
+        const match = /^([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$/.exec(
+          req.params.assetName,
+        );
+        const requestedMimeType = match
+          ? imageMimeTypeForFileExtension(match[2])
+          : null;
+        if (!match || !requestedMimeType) {
+          return res.status(400).json({ error: 'Invalid report image asset' });
+        }
+
+        const [, imageId] = match;
+        const externalAssetPath = join(
+          dirname(report.path),
+          'screenshots',
+          req.params.assetName,
+        );
+        const externalAssetExists = await stat(externalAssetPath)
+          .then((entry) => entry.isFile())
+          .catch(() => false);
+        res.setHeader('Cache-Control', 'private, max-age=3600');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+        if (externalAssetExists) {
+          res.type(requestedMimeType);
+          return res.sendFile(externalAssetPath);
+        }
+
+        try {
+          const dataUri = await extractInlineReportImage(report.path, imageId);
+          if (!dataUri) {
+            return res.status(404).json({ error: 'Report image not found' });
+          }
+          const parsedImage = parseBase64ImageDataUrl(dataUri);
+          if (parsedImage.mimeType !== requestedMimeType) {
+            throw new Error(
+              `Report image extension does not match its MIME type: ${req.params.assetName}`,
+            );
+          }
+          return res
+            .type(parsedImage.mimeType)
+            .send(Buffer.from(parsedImage.rawBase64, 'base64'));
+        } catch (error) {
+          debugReport('failed to stream report image: %s', error);
+          return res.status(500).json({ error: 'Failed to load report image' });
+        }
+      },
+    );
+
+    this._app.get('/reports/:reportId/', (req: Request, res: Response) => {
+      const report = this.getRegisteredReport(req.params.reportId);
+      if (!report) {
+        return res.status(404).json({ error: 'Report not found or expired' });
+      }
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.type('html');
+      return res.sendFile(report.path);
     });
 
     this._app.get('/session', async (_req: Request, res: Response) => {
@@ -1588,6 +3229,7 @@ class PlaygroundServer {
         ) {
           this.setActiveAgent(await this._activeConnection.agentFactory());
         }
+        this.bindActiveSessionNavigationEvents();
 
         if (this._configDirty && this._activeConnection.agentFactory) {
           this._configDirty = false;
@@ -1784,6 +3426,7 @@ class PlaygroundServer {
         screenshotIncluded,
         domIncluded,
         deviceOptions,
+        reportDisplay,
       } = req.body;
 
       if (!type) {
@@ -1832,9 +3475,12 @@ class PlaygroundServer {
       }
 
       // Lock this task
+      let abortController: AbortController | null = null;
       if (requestId) {
         this.currentTaskId = requestId;
         this.taskExecutionDumps[requestId] = null;
+        abortController = new AbortController();
+        this.taskAbortControllers[requestId] = abortController;
 
         // Use onDumpUpdate to receive and store executionDump directly
         agent.onDumpUpdate = (_dump: string, executionDump?: ExecutionDump) => {
@@ -1847,20 +3493,23 @@ class PlaygroundServer {
 
       const response: {
         result: unknown;
-        dump: ExecutionDump | null;
+        dump: ExecutionDump | ReportActionDump | null;
         error: string | null;
         reportHTML: string | null;
+        report: PlaygroundReportRef | null;
         requestId?: string;
       } = {
         result: null,
         dump: null,
         error: null,
         reportHTML: null,
+        report: null,
         requestId,
       };
 
       const startTime = Date.now();
       try {
+        agent.resetDump?.();
         await this._activeConnection.executionHooks?.beforeExecute?.();
 
         // Get action space to check for dynamic actions
@@ -1874,11 +3523,14 @@ class PlaygroundServer {
         };
 
         response.result = await executeAction(agent, type, actionSpace, value, {
+          requestId,
           deepLocate,
           deepThink,
           screenshotIncluded,
           domIncluded,
+          abortSignal: abortController?.signal,
           deviceOptions,
+          reportDisplay,
         });
       } catch (error: unknown) {
         response.error = formatErrorMessage(error);
@@ -1890,29 +3542,42 @@ class PlaygroundServer {
         }
       }
 
-      try {
-        const dumpString = agent.dumpDataString({
-          inlineScreenshots: true,
-        });
-        if (dumpString) {
-          const groupedDump = ReportActionDump.fromSerializedString(dumpString);
-          // Extract first execution from grouped dump, matching local execution adapter behavior
-          response.dump = groupedDump.executions?.[0] || null;
-        } else {
+      if (abortController?.signal.aborted) {
+        // Cancellation recreates (and therefore destroys) the agent. Do not
+        // synchronously inline every screenshot into both a dump and an HTML
+        // report while that teardown is in progress: on long mobile runs this
+        // blocks Electron's main event loop, including IPC and scrcpy. The
+        // cancel response reads the incrementally persisted report instead.
+        response.dump = null;
+      } else {
+        try {
+          // Snapshot updates await incremental report persistence before the
+          // action resolves. Register that existing artifact instead of
+          // synchronously inlining every screenshot into both a dump and an
+          // HTML report. Large Android runs otherwise starve Electron's main
+          // event loop long enough for the scrcpy Socket.IO heartbeat to fail.
+          const reportStartedAt = Date.now();
+          const reportFile = agent.reportFile;
+          response.report = await this.registerReportFile(reportFile);
           response.dump = null;
-        }
-        response.reportHTML =
-          agent.reportHTMLString({ inlineScreenshots: true }) || null;
+          agent.resetDump();
 
-        agent.writeOutActionDumps();
-        agent.resetDump();
-      } catch (error: unknown) {
-        const errorMessage =
-          error instanceof Error ? error.message : 'Unknown error';
-        console.error(
-          `write out dump failed: requestId: ${requestId}, ${errorMessage}`,
-        );
-      } finally {
+          debugReport(
+            'registered persisted report: requestId=%s, duration=%dms, bytes=%d, file=%s',
+            requestId,
+            Date.now() - reportStartedAt,
+            response.report?.bytes || 0,
+            reportFile || 'none',
+          );
+        } catch (error: unknown) {
+          const errorMessage =
+            error instanceof Error ? error.message : 'Unknown error';
+          debugReport(
+            'register persisted report failed: requestId=%s, error=%s',
+            requestId,
+            errorMessage,
+          );
+        }
       }
 
       res.send(response);
@@ -1931,6 +3596,7 @@ class PlaygroundServer {
       // Clean up task execution dumps and unlock after execution completes
       if (requestId) {
         delete this.taskExecutionDumps[requestId];
+        delete this.taskAbortControllers[requestId];
         // Release the lock
         if (this.currentTaskId === requestId) {
           this.currentTaskId = null;
@@ -1961,27 +3627,21 @@ class PlaygroundServer {
 
           console.log(`Cancelling task: ${requestId}`);
 
-          // Get current execution data before cancelling (dump and reportHTML)
-          let dump: any = null;
-          let reportHTML: string | null = null;
+          const abortController = this.taskAbortControllers[requestId];
+          // Abort before doing any teardown work. The cached progress dump is
+          // already persisted by the report generator, so cancellation does
+          // not need to synchronously serialize inline screenshots.
+          abortController?.abort(
+            new Error(`Task cancelled by user: ${requestId}`),
+          );
 
-          try {
-            const dumpString = agent.dumpDataString?.({
-              inlineScreenshots: true,
-            });
-            if (dumpString) {
-              const groupedDump =
-                ReportActionDump.fromSerializedString(dumpString);
-              // Extract first execution from grouped dump
-              dump = groupedDump.executions?.[0] || null;
-            }
-
-            reportHTML =
-              agent.reportHTMLString?.({
-                inlineScreenshots: true,
-              }) || null;
-          } catch (error: unknown) {
-            console.warn('Failed to get execution data before cancel:', error);
+          // A progress dump can reach the UI immediately before its queued
+          // report write starts. Persist that latest snapshot before destroy()
+          // flushes and finalizes the report, otherwise a stopped run can show
+          // a Timeline but have no report artifact to register.
+          const latestExecutionDump = this.taskExecutionDumps[requestId];
+          if (latestExecutionDump) {
+            agent.writeOutActionDumps?.(latestExecutionDump);
           }
 
           // Destroy and recreate agent to cancel the current task,
@@ -1995,15 +3655,32 @@ class PlaygroundServer {
             console.warn('Failed to recreate agent during cancel:', error);
           }
 
+          let report: PlaygroundReportRef | null = null;
+          if (agent.reportFile) {
+            try {
+              // Agent.destroy() finalizes the incrementally persisted report
+              // before recreateAgent() resolves. Return an opaque streaming URL
+              // instead of putting the full artifact in cancellation JSON.
+              report = await this.registerReportFile(agent.reportFile);
+            } catch (error) {
+              debugCancel(
+                'Failed to register finalized report after cancel: %s',
+                error,
+              );
+            }
+          }
+
           // Clean up
           delete this.taskExecutionDumps[requestId];
+          delete this.taskAbortControllers[requestId];
           this.currentTaskId = null;
 
           res.json({
             status: 'cancelled',
             message: 'Task cancelled successfully',
-            dump,
-            reportHTML,
+            dump: null,
+            reportHTML: null,
+            report,
           });
         } catch (error: unknown) {
           const errorMessage =
@@ -2066,6 +3743,11 @@ class PlaygroundServer {
     );
 
     this._app.post('/recorder/stop', async (_req: Request, res: Response) => {
+      // URL changes caused by a click are not separate replay actions. Stop
+      // only waits for queued user-action capture, so a destroyed page context
+      // cannot delay finishing the recording.
+      await this.waitForQueuedRecorderEvents();
+      this.flushPendingTypeOnlyRecorderInput();
       this._recorderSessionId = null;
       this._studioPreviewRecorderLastScreenshot = undefined;
       this._studioPreviewRecorderLastPageState = undefined;
@@ -2073,6 +3755,9 @@ class PlaygroundServer {
     });
 
     this._app.get('/recorder/events', async (req: Request, res: Response) => {
+      if (req.query.flushPending !== 'false') {
+        this.flushPendingTypeOnlyRecorderInput();
+      }
       const since =
         typeof req.query.since === 'string'
           ? Number.parseInt(req.query.since, 10)
@@ -2083,6 +3768,116 @@ class PlaygroundServer {
         nextIndex: this._recorderEvents.length,
       });
     });
+
+    this._app.get(
+      '/recorder/assets/:assetId',
+      async (req: Request, res: Response) => {
+        try {
+          const assetId = String(req.params.assetId || '');
+          const filePath = findRecorderScreenshotAssetPath(assetId);
+          if (!filePath) {
+            return res
+              .status(404)
+              .json({ error: 'Recorder screenshot not found' });
+          }
+          res.type(filePath.endsWith('.jpg') ? 'image/jpeg' : 'image/png');
+          return res.send(readFileSync(filePath));
+        } catch (error) {
+          return res.status(400).json({
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Invalid recorder screenshot request',
+          });
+        }
+      },
+    );
+
+    this._app.delete(
+      '/recorder/assets/session/:sessionId',
+      async (req: Request, res: Response) => {
+        try {
+          removeRecorderScreenshotAssetsForSession(
+            String(req.params.sessionId || ''),
+          );
+          return res.json({ ok: true });
+        } catch (error) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Invalid recorder session id',
+          });
+        }
+      },
+    );
+
+    this._app.post(
+      '/recorder/assets/session/:sessionId/prune',
+      async (req: Request, res: Response) => {
+        try {
+          const assetIds = Array.isArray(req.body?.assetIds)
+            ? req.body.assetIds.filter(
+                (assetId: unknown): assetId is string =>
+                  typeof assetId === 'string',
+              )
+            : [];
+          pruneRecorderScreenshotAssetsForSession(
+            String(req.params.sessionId || ''),
+            assetIds,
+          );
+          return res.json({ ok: true });
+        } catch (error) {
+          return res.status(400).json({
+            ok: false,
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Invalid recorder screenshot cleanup request',
+          });
+        }
+      },
+    );
+
+    this._app.post(
+      '/recorder/describe-event',
+      async (req: Request, res: Response) => {
+        const event = req.body?.event as PlaygroundRecorderEvent | undefined;
+        if (!event || typeof event !== 'object') {
+          return res.status(400).json({
+            ok: false,
+            error: 'event is required',
+          });
+        }
+
+        try {
+          const agent = this.getActiveAgentOrThrow();
+          const { event: describedEvent, trace } =
+            await this.enrichStudioPreviewRecorderEventWithAiDescribe(
+              event,
+              agent,
+            );
+          res.json({ ok: true, event: describedEvent, trace });
+        } catch (error) {
+          const startedAt = new Date();
+          const traceBase = createRecorderAiDescribeTraceBase(event);
+          const trace: PlaygroundRecorderDescribeTrace = {
+            ...traceBase,
+            status: 'failed',
+            startedAt: startedAt.toISOString(),
+            durationMs: 0,
+            error: error instanceof Error ? error.message : String(error),
+          };
+          debugInteract('recorder aiDescribe trace:', trace);
+          res.status(500).json({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            trace,
+          });
+        }
+      },
+    );
 
     // Screenshot API for real-time screenshot polling
     this._app.get('/screenshot', async (_req: Request, res: Response) => {
@@ -2223,7 +4018,7 @@ class PlaygroundServer {
           hasInputPrimitives: Boolean(agent.interface.inputPrimitives),
         });
         const recorderSnapshotBefore =
-          await this.captureRecorderSnapshotBeforeInteract();
+          this.captureCachedRecorderSnapshotBeforeInteract();
         const inputPrimitives = agent.interface.inputPrimitives;
         if (inputPrimitives) {
           await dispatchPointer(inputPrimitives, req.body ?? {}, () =>
@@ -2233,15 +4028,16 @@ class PlaygroundServer {
             payload: summarizeInteractPayload(req.body ?? {}),
             elapsedMs: Date.now() - interactStartedAt,
           });
-          await this.storeStudioPreviewRecorderEvent(
+          res.json({});
+          this.queueStudioPreviewRecorderEvent(
             req.body ?? {},
             recorderSnapshotBefore,
+            agent,
           );
           debugInteract('manual interact completed %o', {
             payload: summarizeInteractPayload(req.body ?? {}),
             elapsedMs: Date.now() - interactStartedAt,
           });
-          res.json({});
           return;
         }
 
@@ -2262,15 +4058,16 @@ class PlaygroundServer {
           payload: summarizeInteractPayload(req.body ?? {}),
           elapsedMs: Date.now() - interactStartedAt,
         });
-        await this.storeStudioPreviewRecorderEvent(
+        res.json({});
+        this.queueStudioPreviewRecorderEvent(
           req.body ?? {},
           recorderSnapshotBefore,
+          agent,
         );
         debugInteract('manual interact completed %o', {
           payload: summarizeInteractPayload(req.body ?? {}),
           elapsedMs: Date.now() - interactStartedAt,
         });
-        res.json({});
       } catch (error: unknown) {
         if (error instanceof PointerInputError) {
           return res.status(error.statusCode).json({ error: error.message });
@@ -2373,29 +4170,29 @@ class PlaygroundServer {
       });
     });
 
-    this.app.post(
-      '/connectivity-test',
-      async (_req: Request, res: Response) => {
-        try {
-          const result = await runConnectivityTest({
-            defaultModelConfig:
-              globalModelConfigManager.getModelConfig('default'),
-            planningModelConfig:
-              globalModelConfigManager.getModelConfig('planning'),
-            insightModelConfig:
-              globalModelConfigManager.getModelConfig('insight'),
-          });
-          return res.json(result);
-        } catch (error: unknown) {
-          const errorMessage =
-            error instanceof Error ? error.message : 'Unknown error';
-          console.error(`Connectivity test failed: ${errorMessage}`);
-          return res.status(500).json({
-            error: errorMessage,
+    this.app.post('/connectivity-test', async (req: Request, res: Response) => {
+      try {
+        if (!req.body?.config) {
+          return res.status(400).json({
+            error: 'Model config is required for connectivity test.',
           });
         }
-      },
-    );
+        const modelConfigManager = new ModelConfigManager(req.body.config);
+        const result = await runConnectivityTest({
+          defaultModelConfig: modelConfigManager.getModelConfig('default'),
+          planningModelConfig: modelConfigManager.getModelConfig('planning'),
+          insightModelConfig: modelConfigManager.getModelConfig('insight'),
+        });
+        return res.json(result);
+      } catch (error: unknown) {
+        const errorMessage =
+          error instanceof Error ? error.message : 'Unknown error';
+        console.error(`Connectivity test failed: ${errorMessage}`);
+        return res.status(500).json({
+          error: errorMessage,
+        });
+      }
+    });
   }
 
   /**
@@ -2472,7 +4269,8 @@ class PlaygroundServer {
 
     return new Promise((resolve) => {
       const serverPort = this.port ?? defaultPort;
-      this.server = this._app.listen(serverPort, '0.0.0.0', () => {
+      const listenHost = resolvePlaygroundListenHost();
+      this.server = this._app.listen(serverPort, listenHost, () => {
         resolve(this);
       });
     });
@@ -2486,6 +4284,7 @@ class PlaygroundServer {
       console.warn('Failed to destroy current session during shutdown:', error);
     });
     this._mjpegHandler.shutdown();
+    this.reportFiles.clear();
 
     return new Promise((resolve, reject) => {
       if (this.server) {

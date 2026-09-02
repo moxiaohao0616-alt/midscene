@@ -8,12 +8,20 @@ import type {
 import {
   type AbstractInterface,
   type ComputerInputPrimitives,
+  type ResolvedTextInputOptions,
   defineAction,
   defineActionsFromInputPrimitives,
+  resolveTextInputOptions,
+  sendTextSequentially,
+  shouldInputSequentially,
 } from '@midscene/core/device';
 import { sleep } from '@midscene/core/utils';
 import { getDebug } from '@midscene/shared/logger';
-import type { DisplayInfo } from '../device';
+import type { ComputerDeviceInputOpt, DisplayInfo } from '../device';
+import {
+  formatRdpServerAddress,
+  normalizeRdpConnectionConfig,
+} from './address';
 import { createDefaultRDPBackendClient } from './backend-client';
 import type {
   RDPBackendClient,
@@ -42,7 +50,9 @@ const DEFAULT_SCROLL_VIEWPORT_RATIO = 0.7;
 const EDGE_SCROLL_STEPS = 10;
 const DEFAULT_SCROLL_STEP_AMOUNT = 120;
 
-export interface RDPDeviceOpt extends RDPConnectionConfig {
+export interface RDPDeviceOpt
+  extends RDPConnectionConfig,
+    ComputerDeviceInputOpt {
   backend?: RDPBackendClient;
   customActions?: DeviceAction<any>[];
 }
@@ -50,7 +60,9 @@ export interface RDPDeviceOpt extends RDPConnectionConfig {
 export class RDPDevice implements AbstractInterface {
   interfaceType: InterfaceType = 'rdp';
 
-  private readonly options: RDPDeviceOpt;
+  private readonly connectionConfig: RDPConnectionConfig;
+  private readonly inputOptions: ComputerDeviceInputOpt;
+  private readonly customActions: DeviceAction<any>[];
   private readonly backend: RDPBackendClient;
   private connectionInfo?: RDPConnectionInfo;
   private destroyed = false;
@@ -107,6 +119,10 @@ export class RDPDevice implements AbstractInterface {
     keyboard: {
       typeText: async (value, opts) => {
         this.assertConnected();
+        const resolvedInputOptions = resolveTextInputOptions(
+          opts,
+          this.inputOptions,
+        );
         const target = opts?.target as LocateResultElement | undefined;
         if (target) {
           await this.inputPrimitives.pointer!.tap({
@@ -122,7 +138,7 @@ export class RDPDevice implements AbstractInterface {
         if (opts?.focusOnly || !value) {
           return;
         }
-        await this.backend.typeText(value);
+        await this.typeText(value, resolvedInputOptions);
       },
       clearInput: async (target) => {
         this.assertConnected();
@@ -184,44 +200,64 @@ export class RDPDevice implements AbstractInterface {
     },
   };
 
+  private async typeText(
+    value: string,
+    inputOptions: ResolvedTextInputOptions,
+  ): Promise<void> {
+    if (!shouldInputSequentially(inputOptions)) {
+      await this.backend.typeText(value);
+      return;
+    }
+
+    await sendTextSequentially(
+      value,
+      {
+        sendCharacter: (character) => this.backend.typeText(character),
+        wait: sleep,
+      },
+      { delayMs: inputOptions.keyboardTypeDelay },
+    );
+  }
+
   constructor(options: RDPDeviceOpt) {
-    this.options = {
+    const {
+      backend,
+      customActions,
+      inputStrategy,
+      keyboardTypeDelay,
+      ...connectionConfig
+    } = options;
+    this.connectionConfig = {
       port: 3389,
       securityProtocol: 'auto',
       ignoreCertificate: false,
-      ...options,
+      ...normalizeRdpConnectionConfig(connectionConfig),
     };
-    this.backend = options.backend || createDefaultRDPBackendClient();
+    this.inputOptions = { inputStrategy, keyboardTypeDelay };
+    this.customActions = customActions ?? [];
+    this.backend = backend || createDefaultRDPBackendClient();
   }
 
   describe(): string {
-    const port = this.options.port || 3389;
-    const username = this.options.username
-      ? ` as ${this.options.username}`
+    const port = this.connectionConfig.port || 3389;
+    const server = formatRdpServerAddress(this.connectionConfig.host, port);
+    const username = this.connectionConfig.username
+      ? ` as ${this.connectionConfig.username}`
       : '';
     const session = this.connectionInfo?.sessionId
       ? ` [session ${this.connectionInfo.sessionId}]`
       : '';
-    return `RDP Device ${this.options.host}:${port}${username}${session}`;
+    return `RDP Device ${server}${username}${session}`;
   }
 
   async connect(): Promise<void> {
     this.throwIfDestroyed();
     debug('connecting to rdp backend', {
-      host: this.options.host,
-      port: this.options.port,
-      username: this.options.username,
+      host: this.connectionConfig.host,
+      port: this.connectionConfig.port,
+      username: this.connectionConfig.username,
     });
-    // Only forward serializable connection settings. `backend` and
-    // `customActions` are runtime objects (the backend instance even holds a
-    // live child process with circular references); leaking them into the
-    // config sent over the helper's JSON protocol corrupts the request line.
-    const {
-      backend: _backend,
-      customActions: _customActions,
-      ...config
-    } = this.options;
-    this.connectionInfo = await this.backend.connect(config);
+    this.connectionInfo = await this.backend.connect(this.connectionConfig);
     this.cursorPosition = [
       Math.round(this.connectionInfo.size.width / 2),
       Math.round(this.connectionInfo.size.height / 2),
@@ -257,10 +293,16 @@ export class RDPDevice implements AbstractInterface {
         call: async (): Promise<DisplayInfo[]> => {
           this.assertConnected();
           const size = await this.size();
+          const server =
+            this.connectionInfo?.server ||
+            formatRdpServerAddress(
+              this.connectionConfig.host,
+              this.connectionConfig.port || 3389,
+            );
           return [
             {
-              id: this.connectionInfo?.sessionId || this.options.host,
-              name: `RDP ${this.connectionInfo?.server || this.options.host} (${size.width}x${size.height})`,
+              id: this.connectionInfo?.sessionId || this.connectionConfig.host,
+              name: `RDP ${server} (${size.width}x${size.height})`,
               primary: true,
             },
           ];
@@ -268,7 +310,7 @@ export class RDPDevice implements AbstractInterface {
       }),
     ];
 
-    return [...defaultActions, ...(this.options.customActions || [])];
+    return [...defaultActions, ...this.customActions];
   }
 
   private assertConnected(): void {

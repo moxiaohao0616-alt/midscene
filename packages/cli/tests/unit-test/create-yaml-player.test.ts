@@ -1,64 +1,75 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { createYamlPlayer, launchServer } from '@/create-yaml-player';
-import type { MidsceneYamlScript, MidsceneYamlScriptEnv } from '@midscene/core';
+import type {
+  FreeFn,
+  MidsceneYamlScript,
+  MidsceneYamlScriptEnv,
+} from '@midscene/core';
+import * as agentActual from '@midscene/core/agent' with {
+  rstest: 'importActual',
+};
 import { processCacheConfig } from '@midscene/core/utils';
-import { beforeEach, describe, expect, test, vi } from 'vitest';
-
-// Mock the global config manager to control environment variables
-vi.mock('@midscene/shared/env', () => ({
-  MIDSCENE_CACHE: 'MIDSCENE_CACHE',
-  globalConfigManager: {
-    getEnvConfigInBoolean: vi.fn(),
-  },
-}));
+import * as puppeteerAgentLauncherActual from '@midscene/web/puppeteer-agent-launcher' with {
+  rstest: 'importActual',
+};
+import { beforeEach, describe, expect, rs, test } from '@rstest/core';
 
 // Mock dependencies
-vi.mock('node:fs', () => ({
-  readFileSync: vi.fn(),
+rs.mock('node:fs', () => ({
+  readFileSync: rs.fn(),
 }));
 
-vi.mock('http-server', () => ({
-  createServer: vi.fn(),
+rs.mock('http-server', () => ({
+  createServer: rs.fn(),
 }));
 
-vi.mock('@midscene/core/yaml', () => ({
-  ScriptPlayer: vi.fn(),
-  parseYamlScript: vi.fn(),
+rs.mock('@midscene/core/yaml', { spy: true });
+
+rs.mock('@midscene/core/agent', () => ({
+  ...agentActual,
+  createAgent: rs.fn(),
+  getReportFileName: rs.fn((tag: string) => `${tag}-mock-report`),
 }));
 
-vi.mock('@midscene/core/agent', () => ({
-  createAgent: vi.fn(),
-  getReportFileName: vi.fn((tag: string) => `${tag}-mock-report`),
+rs.mock('@midscene/android', () => ({
+  agentFromAdbDevice: rs.fn(),
 }));
 
-vi.mock('@midscene/android', () => ({
-  agentFromAdbDevice: vi.fn(),
+rs.mock('@midscene/ios', () => ({
+  agentFromWebDriverAgent: rs.fn(),
 }));
 
-vi.mock('@midscene/ios', () => ({
-  agentFromWebDriverAgent: vi.fn(),
+rs.mock('@midscene/harmony', () => ({
+  agentFromHdcDevice: rs.fn(),
 }));
 
-vi.mock('@midscene/harmony', () => ({
-  agentFromHdcDevice: vi.fn(),
+rs.mock('@midscene/web/bridge-mode', () => ({
+  AgentOverChromeBridge: rs.fn(),
 }));
 
-vi.mock('@midscene/web/bridge-mode', () => ({
-  AgentOverChromeBridge: vi.fn(),
+rs.mock('@midscene/web/puppeteer-agent-launcher', () => ({
+  ...puppeteerAgentLauncherActual,
+  buildDownloadBehavior: (downloadPath: string | undefined) =>
+    downloadPath
+      ? {
+          policy: 'allow',
+          downloadPath: downloadPath.startsWith('/')
+            ? downloadPath
+            : `${process.cwd()}/${downloadPath.replace(/^\.\//, '')}`,
+        }
+      : undefined,
+  puppeteerAgentForTarget: rs.fn(),
 }));
 
-vi.mock('@midscene/web/puppeteer-agent-launcher', () => ({
-  puppeteerAgentForTarget: vi.fn(),
+rs.mock('@midscene/web/puppeteer', () => ({
+  PuppeteerAgent: rs.fn(),
 }));
 
-vi.mock('@midscene/web/puppeteer', () => ({
-  PuppeteerAgent: vi.fn(),
-}));
-
-vi.mock('puppeteer', () => ({
+rs.mock('puppeteer', () => ({
   default: {
-    connect: vi.fn(),
-    launch: vi.fn(),
+    connect: rs.fn(),
+    launch: rs.fn(),
   },
 }));
 
@@ -71,6 +82,8 @@ import { globalConfigManager } from '@midscene/shared/env';
 import { AgentOverChromeBridge } from '@midscene/web/bridge-mode';
 import { puppeteerAgentForTarget } from '@midscene/web/puppeteer-agent-launcher';
 import { createServer } from 'http-server';
+
+rs.spyOn(globalConfigManager, 'getEnvConfigInBoolean');
 
 /**
  * Test helper: Gets the arguments from a specific mock function call.
@@ -87,26 +100,26 @@ describe('create-yaml-player', () => {
   const mockFilePath = '/test/script.yml';
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    rs.clearAllMocks();
   });
 
   describe('launchServer', () => {
     test('should launch HTTP server and resolve with server instance', async () => {
       const mockServer = {
-        listen: vi.fn((_port, _host, callback) => {
+        listen: rs.fn((_port, _host, callback) => {
           // Simulate async server start
           setTimeout(() => callback(), 0);
         }),
         server: {
-          address: vi.fn().mockReturnValue({
+          address: rs.fn().mockReturnValue({
             address: '127.0.0.1',
             port: 8080,
           }),
-          close: vi.fn(),
+          close: rs.fn(),
         },
       };
 
-      vi.mocked(createServer).mockReturnValue(mockServer);
+      rs.mocked(createServer).mockReturnValue(mockServer);
 
       const result = await launchServer('/test/dir');
 
@@ -131,11 +144,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -154,6 +167,144 @@ describe('create-yaml-player', () => {
       expect(result).toBe(mockPlayer);
     });
 
+    test('should pass explicit page target to puppeteer launcher', async () => {
+      const mockScript: MidsceneYamlScript = {
+        page: {
+          url: 'http://example.com',
+        },
+        tasks: [],
+      };
+      const mockAgent = { destroy: rs.fn() };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
+        agent: mockAgent as any,
+        freeFn: [],
+      });
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+      await setupFnCallback?.();
+
+      expect(puppeteerAgentForTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          mode: 'page',
+          url: 'http://example.com',
+        }),
+        expect.any(Object),
+        undefined,
+        undefined,
+        undefined,
+      );
+    });
+
+    test('should pass explicit browser target to puppeteer launcher', async () => {
+      const mockScript: MidsceneYamlScript = {
+        browser: {
+          url: 'http://example.com',
+          autoFollowNewPage: true,
+        },
+        tasks: [],
+      };
+      const mockAgent = { destroy: rs.fn() };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
+        agent: mockAgent as any,
+        freeFn: [],
+      });
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+      await setupFnCallback?.();
+
+      expect(puppeteerAgentForTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          mode: 'browser',
+          url: 'http://example.com',
+          autoFollowNewPage: true,
+        }),
+        expect.any(Object),
+        undefined,
+        undefined,
+        undefined,
+      );
+    });
+
+    test('should close a local server when Puppeteer setup fails', async () => {
+      const navigationError = new Error('navigation failed');
+      const close = rs.fn((callback: (error?: Error) => void) => callback());
+      const mockServer = {
+        listen: rs.fn((_port, _host, callback) => callback()),
+        server: {
+          address: rs.fn().mockReturnValue({
+            address: '127.0.0.1',
+            port: 8080,
+          }),
+          close,
+        },
+      };
+      const mockScript: MidsceneYamlScript = {
+        page: {
+          url: '/test.html',
+          serve: './fixtures',
+        },
+        tasks: [],
+      };
+      let setupFnCallback: (() => Promise<unknown>) | undefined;
+
+      rs.mocked(createServer).mockReturnValue(mockServer);
+      rs.mocked(puppeteerAgentForTarget).mockRejectedValue(navigationError);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<unknown>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+
+      await expect(setupFnCallback?.()).rejects.toBe(navigationError);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    test('should reject conflicting web targets during setup', async () => {
+      const mockScript: MidsceneYamlScript = {
+        page: {
+          url: 'http://example.com/page',
+        },
+        browser: {
+          url: 'http://example.com/browser',
+        },
+        tasks: [],
+      };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+
+      expect(setupFnCallback).toBeDefined();
+      await expect(setupFnCallback!()).rejects.toThrow(
+        'Only one web target can be specified',
+      );
+    });
+
     test('should create player with bridge mode configuration', async () => {
       const mockScript: MidsceneYamlScript = {
         web: {
@@ -163,11 +314,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -190,11 +341,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -215,11 +366,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -235,11 +386,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -258,11 +409,11 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockPlayer = { addCleanup: vi.fn() };
+      const mockPlayer = { addCleanup: rs.fn() };
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(ScriptPlayer).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(ScriptPlayer).mockImplementation(
         () => mockPlayer as unknown as ScriptPlayer<MidsceneYamlScriptEnv>,
       );
 
@@ -275,12 +426,49 @@ describe('create-yaml-player', () => {
 
       expect(result).toBe(mockPlayer);
     });
+
+    test('should pass web downloadPath to puppeteer agent launcher', async () => {
+      const mockScript: MidsceneYamlScript = {
+        web: {
+          url: 'http://example.com',
+          downloadPath: './downloads',
+        },
+        tasks: [],
+      };
+      const mockAgent = { destroy: rs.fn() };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
+        agent: mockAgent as any,
+        freeFn: [],
+      });
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+      await setupFnCallback?.();
+
+      expect(puppeteerAgentForTarget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: 'http://example.com',
+          downloadPath: './downloads',
+        }),
+        expect.any(Object),
+        undefined,
+        undefined,
+        undefined,
+      );
+    });
   });
 
   describe('Cache configuration - Legacy compatibility mode', () => {
     test('should enable cache when MIDSCENE_CACHE env var is true (legacy mode)', () => {
       // Mock environment variable to enable legacy cache mode
-      vi.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
+      rs.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
         true,
       );
 
@@ -302,7 +490,7 @@ describe('create-yaml-player', () => {
 
     test('should not enable cache when MIDSCENE_CACHE env var is false (legacy mode)', () => {
       // Mock environment variable to disable legacy cache mode
-      vi.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
+      rs.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
         false,
       );
 
@@ -321,7 +509,7 @@ describe('create-yaml-player', () => {
 
     test('should prefer explicit cache config over legacy mode', () => {
       // Mock environment variable to enable legacy cache mode
-      vi.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
+      rs.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
         true,
       );
 
@@ -386,7 +574,7 @@ describe('create-yaml-player', () => {
     });
 
     test('should pass explicit cache false to the web agent even when legacy env enables cache', async () => {
-      vi.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
+      rs.mocked(globalConfigManager.getEnvConfigInBoolean).mockReturnValue(
         true,
       );
 
@@ -397,17 +585,17 @@ describe('create-yaml-player', () => {
         },
         tasks: [],
       };
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -420,6 +608,7 @@ describe('create-yaml-player', () => {
         expect.objectContaining({
           cache: false,
         }),
+        undefined,
         undefined,
         undefined,
       );
@@ -449,26 +638,24 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         // Capture the setup function to call it later
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
       await createYamlPlayer(mockFilePath, mockScript);
 
       // Call the setup function that was passed to ScriptPlayer
-      if (setupFnCallback) {
-        await setupFnCallback();
-      }
+      await setupFnCallback?.();
 
       // Verify agentFromAdbDevice was called with deviceId and all options
       expect(agentFromAdbDevice).toHaveBeenCalledWith(
@@ -494,10 +681,9 @@ describe('create-yaml-player', () => {
 
     test('should pass all iOS device options from YAML to agentFromWebDriverAgent', async () => {
       const mockIOSOptions = {
-        deviceId: '00008110-000123456789ABCD',
         wdaPort: 8100,
         wdaHost: '192.168.1.100',
-        useWDA: true,
+        sessionId: 'external-session-id',
         autoDismissKeyboard: true,
         launch: 'com.example.app',
       };
@@ -507,16 +693,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -530,24 +716,23 @@ describe('create-yaml-player', () => {
       // Verify agentFromWebDriverAgent was called with all options
       expect(agentFromWebDriverAgent).toHaveBeenCalledWith(
         expect.objectContaining({
-          deviceId: mockIOSOptions.deviceId,
           wdaPort: mockIOSOptions.wdaPort,
           wdaHost: mockIOSOptions.wdaHost,
-          useWDA: mockIOSOptions.useWDA,
+          sessionId: mockIOSOptions.sessionId,
           autoDismissKeyboard: mockIOSOptions.autoDismissKeyboard,
           launch: mockIOSOptions.launch,
         }),
       );
     });
 
-    test('should pass all HarmonyOS device options from YAML to agentFromHdcDevice', async () => {
+    test('should launch a mapped explicit HarmonyOS ability from YAML', async () => {
       const mockHarmonyOptions = {
         deviceId: 'harmony-device-1',
         hdcPath: '/custom/path/to/hdc',
         autoDismissKeyboard: true,
         keyboardDismissStrategy: 'esc-first' as const,
-        appNameMapping: { 携程: 'com.ctrip.harmonynext' },
-        launch: 'com.example.app',
+        appNameMapping: { XXX: 'com.XXX/PhoneAbility' },
+        launch: 'XXX',
       };
 
       const mockScript: MidsceneYamlScript = {
@@ -555,16 +740,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromHdcDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromHdcDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -595,16 +780,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromHdcDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromHdcDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -630,16 +815,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -665,16 +850,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -702,16 +887,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -734,7 +919,7 @@ describe('create-yaml-player', () => {
     test('should pass aiActionContext from agent config to iOS agent', async () => {
       const mockScript: MidsceneYamlScript = {
         ios: {
-          deviceId: 'test-ios-device',
+          wdaPort: 8100,
         },
         agent: {
           aiActionContext: 'This is a test context for iOS',
@@ -742,16 +927,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -783,26 +968,26 @@ describe('create-yaml-player', () => {
       };
 
       const mockAgent = {
-        destroy: vi.fn(),
-        connectNewTabWithUrl: vi.fn(),
+        destroy: rs.fn(),
+        connectNewTabWithUrl: rs.fn(),
       };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
       // Mock AgentOverChromeBridge from the bridge-mode module
       const { AgentOverChromeBridge } = await import(
         '@midscene/web/bridge-mode'
       );
-      vi.mocked(AgentOverChromeBridge).mockImplementation(
+      rs.mocked(AgentOverChromeBridge).mockImplementation(
         (opts) => mockAgent as any,
       );
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -821,6 +1006,44 @@ describe('create-yaml-player', () => {
       );
     });
 
+    test('should warn that downloadPath is ignored in bridge mode', async () => {
+      const mockScript: MidsceneYamlScript = {
+        web: {
+          url: 'http://example.com',
+          bridgeMode: 'newTabWithUrl',
+          downloadPath: './downloads',
+        },
+        tasks: [],
+      };
+
+      const mockAgent = {
+        destroy: rs.fn(),
+        connectNewTabWithUrl: rs.fn().mockResolvedValue(undefined),
+      };
+      const warnSpy = rs.spyOn(console, 'warn').mockImplementation(() => {});
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(AgentOverChromeBridge).mockImplementation(
+        () => mockAgent as any,
+      );
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+      await setupFnCallback?.();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('downloadPath'),
+      );
+      warnSpy.mockRestore();
+    });
+
     test('should handle undefined aiActionContext gracefully for Android', async () => {
       const mockScript: MidsceneYamlScript = {
         android: {
@@ -830,16 +1053,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -852,12 +1075,12 @@ describe('create-yaml-player', () => {
 
       // Verify that when agent config is undefined, reportFileName is set from fileName
       // and aiActionContext is not present (undefined fields are not spread)
-      const callArgs = getMockCallArg(vi.mocked(agentFromAdbDevice), 0, 1);
+      const callArgs = getMockCallArg(rs.mocked(agentFromAdbDevice), 0, 1);
       expect(callArgs).toMatchObject({
         reportFileName: 'script-mock-report',
         deviceId: 'test-device',
       });
-      expect(vi.mocked(getReportFileName)).toHaveBeenCalledWith('script');
+      expect(rs.mocked(getReportFileName)).toHaveBeenCalledWith('script');
       expect(callArgs).not.toHaveProperty('aiActionContext');
     });
 
@@ -868,16 +1091,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -890,11 +1113,11 @@ describe('create-yaml-player', () => {
 
       // Verify that when agent config is undefined, reportFileName is set from fileName
       // and aiActionContext is not present (undefined fields are not spread)
-      const callArgs = getMockCallArg(vi.mocked(agentFromWebDriverAgent), 0, 0);
+      const callArgs = getMockCallArg(rs.mocked(agentFromWebDriverAgent), 0, 0);
       expect(callArgs).toMatchObject({
         reportFileName: 'script-mock-report',
       });
-      expect(vi.mocked(getReportFileName)).toHaveBeenCalledWith('script');
+      expect(rs.mocked(getReportFileName)).toHaveBeenCalledWith('script');
       expect(callArgs).not.toHaveProperty('aiActionContext');
     });
 
@@ -904,19 +1127,19 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       const setupFnCallbacks: Array<() => Promise<any>> = [];
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(getReportFileName)
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(getReportFileName)
         .mockReturnValueOnce('script-run-1')
         .mockReturnValueOnce('script-run-2');
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallbacks.push(setupFn as () => Promise<any>);
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -927,14 +1150,14 @@ describe('create-yaml-player', () => {
         await setupFn();
       }
 
-      expect(vi.mocked(agentFromWebDriverAgent).mock.calls).toHaveLength(2);
+      expect(rs.mocked(agentFromWebDriverAgent).mock.calls).toHaveLength(2);
       expect(
-        getMockCallArg(vi.mocked(agentFromWebDriverAgent), 0, 0),
+        getMockCallArg(rs.mocked(agentFromWebDriverAgent), 0, 0),
       ).toMatchObject({
         reportFileName: 'script-run-1',
       });
       expect(
-        getMockCallArg(vi.mocked(agentFromWebDriverAgent), 1, 0),
+        getMockCallArg(rs.mocked(agentFromWebDriverAgent), 1, 0),
       ).toMatchObject({
         reportFileName: 'script-run-2',
       });
@@ -961,31 +1184,29 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
       await createYamlPlayer(mockFilePath, mockScript);
 
       // Call the setup function
-      if (setupFnCallback) {
-        await setupFnCallback();
-      }
+      await setupFnCallback?.();
 
       // Verify all agent options were passed
-      // Note: YAML testId takes precedence over fileName
+      // Explicit YAML reportFileName should be passed through unchanged.
       expect(puppeteerAgentForTarget).toHaveBeenCalledWith(
         expect.any(Object),
         expect.objectContaining({
@@ -993,12 +1214,13 @@ describe('create-yaml-player', () => {
           groupDescription: 'Custom description',
           generateReport: true,
           autoPrintReportMsg: false,
-          reportFileName: 'custom-report-mock-report',
+          reportFileName: 'custom-report',
           replanningCycleLimit: 25,
           aiActionContext: 'Test context',
         }),
         undefined, // browser
         undefined, // page
+        undefined, // browser context
       );
     });
 
@@ -1015,16 +1237,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromAdbDevice).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1054,16 +1276,16 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn(), launch: vi.fn() };
+      const mockAgent = { destroy: rs.fn(), launch: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(agentFromWebDriverAgent).mockResolvedValue(mockAgent as any);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1075,7 +1297,7 @@ describe('create-yaml-player', () => {
 
       expect(agentFromWebDriverAgent).toHaveBeenCalledWith(
         expect.objectContaining({
-          reportFileName: 'ios-test-report-mock-report',
+          reportFileName: 'ios-test-report',
           autoPrintReportMsg: true,
         }),
       );
@@ -1095,20 +1317,20 @@ describe('create-yaml-player', () => {
       };
 
       const mockAgent = {
-        destroy: vi.fn(),
-        connectCurrentTab: vi.fn().mockResolvedValue(undefined),
+        destroy: rs.fn(),
+        connectCurrentTab: rs.fn().mockResolvedValue(undefined),
       };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(AgentOverChromeBridge).mockImplementation(
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(AgentOverChromeBridge).mockImplementation(
         (opts) => mockAgent as any,
       );
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1138,19 +1360,19 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1170,6 +1392,7 @@ describe('create-yaml-player', () => {
         }),
         undefined, // browser
         undefined, // page
+        undefined, // browser context
       );
     });
 
@@ -1185,19 +1408,19 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1215,6 +1438,7 @@ describe('create-yaml-player', () => {
         }),
         undefined, // browser
         undefined, // page
+        undefined, // browser context
       );
     });
 
@@ -1228,19 +1452,19 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1266,40 +1490,42 @@ describe('create-yaml-player', () => {
       };
 
       const mockBrowser = {
-        disconnect: vi.fn(),
+        disconnect: rs.fn(),
       };
-      const mockAgent = { destroy: vi.fn() };
+      const mockAgent = { destroy: rs.fn() };
 
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
       const puppeteer = (await import('puppeteer')).default;
-      vi.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
+      rs.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
 
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
-        freeFn: [],
+        freeFn: [
+          { name: 'midscene_puppeteer_agent', fn: rs.fn() },
+          { name: 'puppeteer_page', fn: rs.fn() },
+        ],
       });
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
       await createYamlPlayer(mockFilePath, mockScript);
 
-      if (setupFnCallback) {
-        await setupFnCallback();
-      }
+      const setupResult = await setupFnCallback?.();
 
       // Should connect via CDP
       expect(puppeteer.connect).toHaveBeenCalledWith({
         browserWSEndpoint: 'ws://localhost:9222/devtools/browser/xxx',
         defaultViewport: null,
+        downloadBehavior: undefined,
       });
 
       // Should reuse puppeteerAgentForTarget (page setup: viewport, userAgent, etc.)
@@ -1308,7 +1534,88 @@ describe('create-yaml-player', () => {
         expect.any(Object),
         mockBrowser, // CDP browser passed as browser param
         undefined, // no shared page
+        undefined, // no shared browser context
       );
+      expect(setupResult?.freeFn.map(({ name }: FreeFn) => name)).toEqual([
+        'midscene_puppeteer_agent',
+        'puppeteer_page',
+        'cdp_browser_disconnect',
+      ]);
+    });
+
+    test('should disconnect an owned CDP browser when agent setup fails', async () => {
+      const setupError = new Error('agent setup failed');
+      const mockBrowser = {
+        disconnect: rs.fn(),
+      };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+      const mockScript: MidsceneYamlScript = {
+        web: {
+          url: 'http://example.com',
+          cdpEndpoint: 'ws://localhost:9222/devtools/browser/xxx',
+        },
+        tasks: [],
+      };
+
+      const puppeteer = (await import('puppeteer')).default;
+      rs.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
+      rs.mocked(puppeteerAgentForTarget).mockRejectedValue(setupError);
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {} as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+
+      await expect(setupFnCallback?.()).rejects.toBe(setupError);
+      expect(mockBrowser.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    test('should configure download behavior via Puppeteer connect options in CDP mode', async () => {
+      const mockScript: MidsceneYamlScript = {
+        web: {
+          url: 'http://example.com',
+          cdpEndpoint: 'ws://localhost:9222/devtools/browser/xxx',
+          downloadPath: './downloads',
+        },
+        tasks: [],
+      };
+
+      const mockBrowser = {
+        disconnect: rs.fn(),
+      };
+      const mockAgent = { destroy: rs.fn() };
+      let setupFnCallback: (() => Promise<any>) | undefined;
+
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
+
+      const puppeteer = (await import('puppeteer')).default;
+      rs.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
+
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
+        agent: mockAgent as any,
+        freeFn: [],
+      });
+
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+        setupFnCallback = setupFn as () => Promise<any>;
+        return {
+          addCleanup: rs.fn(),
+        } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
+      });
+
+      await createYamlPlayer(mockFilePath, mockScript);
+      await setupFnCallback?.();
+
+      expect(puppeteer.connect).toHaveBeenCalledWith({
+        browserWSEndpoint: 'ws://localhost:9222/devtools/browser/xxx',
+        defaultViewport: null,
+        downloadBehavior: {
+          policy: 'allow',
+          downloadPath: path.resolve('./downloads'),
+        },
+      });
     });
 
     test('should pass agent options in CDP mode via puppeteerAgentForTarget', async () => {
@@ -1324,26 +1631,26 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockBrowser = { disconnect: vi.fn() };
-      const mockAgent = { destroy: vi.fn() };
+      const mockBrowser = { disconnect: rs.fn() };
+      const mockAgent = { destroy: rs.fn() };
 
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
       const puppeteer = (await import('puppeteer')).default;
-      vi.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
+      rs.mocked(puppeteer.connect).mockResolvedValue(mockBrowser as any);
 
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1362,6 +1669,7 @@ describe('create-yaml-player', () => {
         }),
         expect.any(Object),
         undefined,
+        undefined,
       );
     });
 
@@ -1374,26 +1682,27 @@ describe('create-yaml-player', () => {
         tasks: [],
       };
 
-      const mockSharedBrowser = { disconnect: vi.fn() };
-      const mockSharedPage = { url: vi.fn() };
-      const mockAgent = { destroy: vi.fn() };
+      const mockSharedBrowser = { disconnect: rs.fn() };
+      const mockSharedPage = { url: rs.fn() };
+      const mockSharedBrowserContext = { newPage: rs.fn() };
+      const mockAgent = { destroy: rs.fn() };
 
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
       const puppeteer = (await import('puppeteer')).default;
 
-      vi.mocked(puppeteerAgentForTarget).mockResolvedValue({
+      rs.mocked(puppeteerAgentForTarget).mockResolvedValue({
         agent: mockAgent as any,
         freeFn: [],
       });
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1401,6 +1710,7 @@ describe('create-yaml-player', () => {
       await createYamlPlayer(mockFilePath, mockScript, {
         browser: mockSharedBrowser as any,
         page: mockSharedPage as any,
+        browserContext: mockSharedBrowserContext as any,
       });
 
       if (setupFnCallback) {
@@ -1416,6 +1726,7 @@ describe('create-yaml-player', () => {
         expect.any(Object),
         mockSharedBrowser,
         mockSharedPage,
+        mockSharedBrowserContext,
       );
     });
 
@@ -1431,13 +1742,13 @@ describe('create-yaml-player', () => {
 
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 
@@ -1458,13 +1769,13 @@ describe('create-yaml-player', () => {
 
       let setupFnCallback: (() => Promise<any>) | undefined;
 
-      vi.mocked(readFileSync).mockReturnValue('mock yaml content');
-      vi.mocked(parseYamlScript).mockReturnValue(mockScript);
+      rs.mocked(readFileSync).mockReturnValue('mock yaml content');
+      rs.mocked(parseYamlScript).mockReturnValue(mockScript);
 
-      vi.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
+      rs.mocked(ScriptPlayer).mockImplementation((script, setupFn) => {
         setupFnCallback = setupFn as () => Promise<any>;
         return {
-          addCleanup: vi.fn(),
+          addCleanup: rs.fn(),
         } as unknown as ScriptPlayer<MidsceneYamlScriptEnv>;
       });
 

@@ -8,7 +8,7 @@
     "Browser use",
     "Android use"
   ],
-  "version": "1.9.2",
+  "version": "1.12.2",
   "repository": "https://github.com/web-infra-dev/midscene",
   "homepage": "https://midscenejs.com/",
   "main": "./dist/lib/index.js",
@@ -84,11 +84,6 @@
       "types": "./dist/types/static/index.d.ts",
       "require": "./dist/lib/static/index.js",
       "import": "./dist/es/static/index.mjs"
-    },
-    "./mcp-server": {
-      "types": "./dist/types/mcp-server.d.ts",
-      "import": "./dist/es/mcp-server.mjs",
-      "require": "./dist/lib/mcp-server.js"
     }
   },
   "scripts": {
@@ -97,10 +92,10 @@
     "build": "rslib build",
     "build:watch": "rslib build --watch --no-clean",
     "playground": "DEBUG=midscene:* tsx demo/playground.ts",
-    "test": "vitest --run",
-    "test:u": "vitest --run -u",
-    "test:ai": "AI_TEST_TYPE=web vitest --run",
-    "test:ai:cache": "MIDSCENE_CACHE=true AI_TEST_TYPE=web vitest --run",
+    "test": "rstest",
+    "test:u": "rstest -u",
+    "test:ai": "AI_TEST_TYPE=web rstest",
+    "test:ai:cache": "MIDSCENE_CACHE=true AI_TEST_TYPE=web rstest",
     "e2e": "playwright test --config=tests/playwright.config.ts",
     "e2e:report": "MIDSCENE_REPORT=true playwright test --config=tests/playwright.config.ts",
     "e2e:cache": "MIDSCENE_CACHE=true playwright test --config=tests/playwright.config.ts",
@@ -128,6 +123,7 @@
   "devDependencies": {
     "@playwright/test": "^1.45.0",
     "@rslib/core": "^0.18.3",
+    "@rstest/core": "0.11.5",
     "@types/chrome": "0.0.279",
     "@types/cors": "^2.8.17",
     "@types/http-server": "^0.12.4",
@@ -140,8 +136,7 @@
     "playwright": "^1.45.0",
     "puppeteer": "24.6.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.8.3",
-    "vitest": "3.0.5"
+    "typescript": "^5.8.3"
   },
   "peerDependencies": {
     "@playwright/test": "^1.45.0",

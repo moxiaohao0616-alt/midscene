@@ -1,9 +1,13 @@
-import type { RecorderYamlGenerationInput } from '@midscene/core/ai-model';
-import type { IModelConfig } from '@midscene/shared/env';
+import type {
+  ConnectivityTestResult,
+  RecorderYamlGenerationInput,
+} from '@midscene/core/ai-model';
+import type { IModelConfig, TModelConfig } from '@midscene/shared/env';
 import type {
   MidsceneRecorderEvent,
   MidsceneRecorderTarget,
 } from '@midscene/shared/recorder';
+import type { StudioAgentOptions } from './agent-options';
 
 /**
  * IPC channel names bridging the Midscene Studio main process and renderer.
@@ -14,6 +18,8 @@ export const IPC_CHANNELS = {
   closeWindow: 'shell:close-window',
   minimizeWindow: 'shell:minimize-window',
   openExternalUrl: 'shell:open-external-url',
+  openRunDirectory: 'shell:open-run-directory',
+  openImagePreview: 'shell:open-image-preview',
   chooseReportSavePath: 'shell:choose-report-save-path',
   chooseFileSavePath: 'shell:choose-file-save-path',
   toggleMaximizeWindow: 'shell:toggle-maximize-window',
@@ -31,6 +37,7 @@ export const IPC_CHANNELS = {
   discoveredDevicesUpdated: 'studio:discovered-devices-updated',
   setDiscoveryPollingPaused: 'studio:set-discovery-polling-paused',
   runConnectivityTest: 'studio:run-connectivity-test',
+  updateAgentOptions: 'studio:update-agent-options',
   generateRecorderCode: 'studio:generate-recorder-code',
   generateRecorderMetadata: 'studio:generate-recorder-metadata',
   describeRecorderUIEvents: 'studio:describe-recorder-ui-events',
@@ -46,11 +53,8 @@ export const IPC_CHANNELS = {
   updaterStatus: 'updater:status',
 } as const;
 
-export interface ConnectivityTestRequest {
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-}
+export type ConnectivityTestRequest = TModelConfig;
+export type { ConnectivityTestResult };
 
 export interface WriteReportFileRequest {
   path: string;
@@ -74,9 +78,10 @@ export interface WriteFileRequest {
   encoding?: 'utf-8' | 'base64';
 }
 
-export type ConnectivityTestResult =
-  | { ok: true; sample: string }
-  | { ok: false; error: string };
+export interface OpenImagePreviewRequest {
+  data: string;
+  fileName?: string;
+}
 
 export type StudioRecorderCodeType = 'markdown' | 'yaml' | 'playwright';
 
@@ -140,7 +145,7 @@ export interface PrepareRecorderMarkdownReplayResult {
 export type ChooseReplayFileResult =
   | {
       type: 'markdown';
-      path: string;
+      content: string;
       displayName: string;
     }
   | {
@@ -231,6 +236,10 @@ export interface ElectronShellApi {
   minimizeWindow: () => Promise<void>;
   /** Open an external HTTP(S) link in the system browser. */
   openExternalUrl: (url: string) => Promise<void>;
+  /** Open the active Midscene run/log directory in the system file manager. */
+  openRunDirectory: () => Promise<void>;
+  /** Open an image with the operating system's default image viewer. */
+  openImagePreview: (request: OpenImagePreviewRequest) => Promise<void>;
   /** Ask the main process for a target path for a report HTML export. */
   chooseReportSavePath: (defaultFileName?: string) => Promise<string | null>;
   /** Ask the main process for a target path for a generic file export. */
@@ -278,6 +287,7 @@ export interface StudioRuntimeApi {
   runConnectivityTest: (
     request: ConnectivityTestRequest,
   ) => Promise<ConnectivityTestResult>;
+  updateAgentOptions: (options: StudioAgentOptions) => Promise<void>;
   generateRecorderCode: (
     request: GenerateRecorderCodeRequest,
   ) => Promise<GenerateRecorderCodeResult>;

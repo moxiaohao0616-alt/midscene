@@ -21,11 +21,51 @@ export const validationAPIs = ['aiAssert', 'aiWaitFor'];
 
 export const noReplayAPIs = [...dataExtractionAPIs, ...validationAPIs];
 
+const agentPromptAPIs = [
+  'aiAct',
+  'runMarkdown',
+  'aiQuery',
+  'aiBoolean',
+  'aiNumber',
+  'aiString',
+  'aiAsk',
+  'aiWaitFor',
+] as const;
+
+type AgentPromptAPI = (typeof agentPromptAPIs)[number];
+
+const agentPromptAPISet = new Set<string>(agentPromptAPIs);
+
+function getAgentPromptAPI(
+  activeAgent: PlaygroundAgent,
+  actionType: string,
+):
+  | ((
+      prompt: string | undefined,
+      options: ExecutionOptions,
+    ) => Promise<unknown>)
+  | undefined {
+  if (!agentPromptAPISet.has(actionType)) {
+    return undefined;
+  }
+
+  const methodName = actionType as AgentPromptAPI;
+  const method = activeAgent[methodName] as unknown;
+  if (typeof method !== 'function') {
+    return undefined;
+  }
+
+  return async (prompt, options) =>
+    (
+      method as (prompt: string, options: ExecutionOptions) => Promise<unknown>
+    ).call(activeAgent, prompt || '', options);
+}
+
 export const formatErrorMessage = (e: any): string => {
   const errorMessage = e?.message || '';
 
   if (errorMessage.includes('of different extension')) {
-    return 'Conflicting extension detected. Please disable the suspicious plugins and refresh the page. Guide: https://midscenejs.com/quick-experience.html#faq';
+    return 'Conflicting extension detected. Please disable the suspicious plugins and refresh the page. Guide: https://midscenejs.com/quick-start.html#chrome-extension-faq';
   }
 
   if (errorMessage.includes('NOT_IMPLEMENTED_AS_DESIGNED')) {
@@ -111,7 +151,6 @@ export function validateStructuredParams(
       locatorFieldKeys.forEach((key: string) => {
         if (typeof paramsForValidation[key] === 'string') {
           paramsForValidation[key] = {
-            midscene_location_field_flag: true,
             prompt: paramsForValidation[key],
             center: [0, 0],
             rect: { left: 0, top: 0, width: 0, height: 0 },
@@ -130,11 +169,7 @@ export function validateStructuredParams(
       const errorMessages = zodError.errors
         .filter((err) => {
           const path = err.path.join('.');
-          return (
-            !path.includes('center') &&
-            !path.includes('rect') &&
-            !path.includes('midscene_location_field_flag')
-          );
+          return !path.includes('center') && !path.includes('rect');
         })
         .map((err) => {
           const field = err.path.join('.');
@@ -207,7 +242,11 @@ export async function executeAction(
 
       // Flatten deviceOptions into the params
       // Destructure to exclude deviceOptions from the final object
-      const { deviceOptions: _, ...optionsWithoutDeviceOptions } = options;
+      const {
+        deviceOptions: _,
+        reportDisplay: __,
+        ...optionsWithoutDeviceOptions
+      } = options;
       const actionParams = {
         locate: detailedLocateParam,
         ...optionsWithoutDeviceOptions,
@@ -223,17 +262,26 @@ export async function executeAction(
     const prompt = value.prompt;
 
     if (actionType === 'aiAssert') {
+      const { reportDisplay: _reportDisplay, ...optionsWithoutReportDisplay } =
+        options;
       const { pass, thought } =
         (await activeAgent?.aiAssert?.(prompt || '', undefined, {
           keepRawResponse: true,
-          ...options,
+          ...optionsWithoutReportDisplay,
         })) || {};
       return { pass: pass || false, thought: thought || '' };
     }
 
-    // Fallback for methods not found in actionSpace
-    if (activeAgent && typeof activeAgent[actionType] === 'function') {
-      return await activeAgent[actionType](prompt, options);
+    const agentPromptAPI = getAgentPromptAPI(activeAgent, actionType);
+    if (agentPromptAPI) {
+      const { reportDisplay, ...agentOptions } = options;
+      const optionsForAgent = reportDisplay
+        ? {
+            ...agentOptions,
+            _internalReportDisplay: reportDisplay,
+          }
+        : agentOptions;
+      return await agentPromptAPI(prompt, optionsForAgent);
     }
 
     throw new Error(`Unknown action type: ${actionType}`);

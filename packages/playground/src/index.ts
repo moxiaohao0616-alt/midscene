@@ -6,7 +6,15 @@ export {
   validateStructuredParams,
   executeAction,
 } from './common';
-export { PlaygroundServer } from './server';
+export { buildPlaygroundBrowserUrl, PlaygroundServer } from './server';
+export {
+  describeRecorderUIEvent,
+  describeRecorderUIEvents,
+  getRecorderUIEventTargetRect,
+  type DescribeRecorderUIEventInput,
+  type DescribeRecorderUIEventOptions,
+  type DescribeRecorderUIEventResult,
+} from './recorder-ui-describer';
 export { playgroundForAgent } from './launcher';
 export { playgroundForAgentFactory } from './launcher';
 export { playgroundForSessionManager } from './launcher';
@@ -43,6 +51,7 @@ export type {
   PlaygroundConfig,
   ExecutionType,
   PlaygroundAdapter,
+  PlaygroundReportRef,
   ServerResponse,
   AgentFactory,
 } from './types';
@@ -60,6 +69,7 @@ export type {
   PlaygroundPreviewDescriptor,
   PlaygroundPreviewKind,
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeResult,
   PlaygroundRecorderEvent,
   PlaygroundRecorderEventsResult,
   PlaygroundRecorderSourceKind,

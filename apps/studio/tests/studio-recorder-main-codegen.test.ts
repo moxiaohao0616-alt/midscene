@@ -16,13 +16,19 @@ vi.mock('@midscene/core/ai-model', () => ({
   ),
 }));
 
+vi.mock('@midscene/playground/recorder-ui-describer', () => ({
+  describeRecorderUIEvents: vi.fn(async () => []),
+}));
+
 import {
   convertRecordLogIntoMarkdown,
   generatePlaywrightTest,
   generateRecorderSessionMetadata,
   generateRecorderYamlTest,
 } from '@midscene/core/ai-model';
+import { describeRecorderUIEvents } from '@midscene/playground/recorder-ui-describer';
 import {
+  describeRecorderUIEventsInMain,
   generateRecorderCodeInMain,
   generateRecorderMetadataInMain,
 } from '../src/main/recorder/codegen';
@@ -95,6 +101,41 @@ describe('Studio recorder codegen in main', () => {
     );
   });
 
+  it('retries Markdown replay generation without screenshots after input length errors', async () => {
+    vi.mocked(convertRecordLogIntoMarkdown)
+      .mockRejectedValueOnce(
+        new Error(
+          'failed to call AI model service: Range of input length should be [1, 991808]',
+        ),
+      )
+      .mockResolvedValueOnce('# Replay recording\n\n## Steps\n1. Open page\n');
+
+    await expect(
+      generateRecorderCodeInMain({
+        ...yamlRequest,
+        type: 'markdown',
+        input: {
+          ...yamlRequest.input,
+          maxScreenshots: 20,
+        },
+      }),
+    ).resolves.toEqual({
+      type: 'markdown',
+      code: '# Replay recording\n\n## Steps\n1. Open page\n',
+    });
+
+    expect(convertRecordLogIntoMarkdown).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ maxScreenshots: 20 }),
+      yamlRequest.modelConfig,
+    );
+    expect(convertRecordLogIntoMarkdown).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ maxScreenshots: 0 }),
+      yamlRequest.modelConfig,
+    );
+  });
+
   it('runs Playwright code generation for Web recordings', async () => {
     await expect(
       generateRecorderCodeInMain({
@@ -155,6 +196,48 @@ describe('Studio recorder codegen in main', () => {
         fallbackName: 'web recording',
       },
       yamlRequest.modelConfig,
+    );
+  });
+
+  it('passes resolved recorder UI describer model config through unchanged', async () => {
+    const event = {
+      type: 'click',
+      actionType: 'Tap',
+      source: 'studio-preview',
+      timestamp: 2,
+      hashId: 'event-click',
+      pageInfo: { width: 1280, height: 720 },
+      elementRect: { x: 120, y: 240 },
+    } as const;
+    vi.mocked(describeRecorderUIEvents).mockResolvedValueOnce([
+      {
+        event,
+        usedFallback: false,
+      },
+    ]);
+
+    await expect(
+      describeRecorderUIEventsInMain({
+        input: {
+          target: yamlRequest.input.target,
+          events: [event],
+        },
+        modelConfig: yamlRequest.modelConfig,
+      }),
+    ).resolves.toEqual({
+      events: [event],
+      results: [{ hashId: 'event-click', usedFallback: false }],
+    });
+
+    expect(describeRecorderUIEvents).toHaveBeenCalledWith(
+      [
+        {
+          event,
+          target: yamlRequest.input.target,
+        },
+      ],
+      yamlRequest.modelConfig,
+      { concurrency: 2 },
     );
   });
 });

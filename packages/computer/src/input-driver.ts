@@ -10,10 +10,14 @@ export interface LibNut {
   scrollMouse(x: number, y: number): void;
   keyTap(key: string, modifiers?: string[]): void;
   typeString(text: string): void;
+  getActiveWindow?(): number;
+  focusWindow?(handle: number): void;
 }
 
 export type MouseButton = 'left' | 'right' | 'middle';
 export type ScrollDirection = 'up' | 'down' | 'left' | 'right';
+
+const MOUSE_COORDINATE_TOLERANCE_PX = 5;
 
 interface ComputerInputDriverOptions {
   getLibnut(): LibNut | null;
@@ -56,6 +60,44 @@ export class ComputerInputDriver {
     this.getLibnutOrThrow('moveMouse').moveMouse(x, y);
   }
 
+  assertMousePosition(
+    targetX: number,
+    targetY: number,
+    context: string,
+  ): { x: number; y: number } {
+    const current = this.getMousePos();
+    const drift = { x: current.x - targetX, y: current.y - targetY };
+    if (
+      Math.abs(drift.x) > MOUSE_COORDINATE_TOLERANCE_PX ||
+      Math.abs(drift.y) > MOUSE_COORDINATE_TOLERANCE_PX
+    ) {
+      throw new Error(
+        `${context}: expected (${targetX}, ${targetY}), got (${current.x}, ${current.y}), drift=(${drift.x}, ${drift.y})`,
+      );
+    }
+    return drift;
+  }
+
+  focusActiveWindow(): boolean {
+    const lib = this.getLibnutOrThrow('focusActiveWindow');
+    if (
+      typeof lib.getActiveWindow !== 'function' ||
+      typeof lib.focusWindow !== 'function'
+    ) {
+      return false;
+    }
+
+    try {
+      const handle = lib.getActiveWindow();
+      if (!handle) return false;
+      lib.focusWindow(handle);
+      return true;
+    } catch (error) {
+      this.options.debug(`focusActiveWindow failed: ${error}`);
+      return false;
+    }
+  }
+
   mouseClick(button?: MouseButton, double?: boolean): void {
     const lib = this.getLibnutOrThrow('mouseClick');
     // libnut is a native binding that distinguishes "no argument" from
@@ -78,6 +120,29 @@ export class ComputerInputDriver {
     this.getLibnutOrThrow('scrollMouse').scrollMouse(x, y);
   }
 
+  /**
+   * Emit one `libnut.scrollMouse` call per detent and pace them with
+   * `delayMs`. Per-call magnitude is fixed by the caller so each call is
+   * exactly one detent on the target platform — on Windows the libnut
+   * binding forwards `mouseData` straight to `MOUSEEVENTF_WHEEL`, where
+   * sub-WHEEL_DELTA values (< 120) get accumulated and frequently dropped
+   * by Chromium's WheelEventQueue.
+   */
+  async emitScrollDetents(
+    dx: number,
+    dy: number,
+    detents: number,
+    delayMs: number,
+  ): Promise<void> {
+    this.assertActive('emitScrollDetents');
+    for (let i = 0; i < detents; i++) {
+      this.scrollMouse(dx, dy);
+      if (i < detents - 1) {
+        await this.delay(delayMs);
+      }
+    }
+  }
+
   keyTap(key: string, modifiers?: string[]): void {
     const lib = this.getLibnutOrThrow('keyTap');
     // See note on mouseClick — avoid passing explicit undefined to libnut.
@@ -86,6 +151,10 @@ export class ComputerInputDriver {
     } else {
       lib.keyTap(key);
     }
+  }
+
+  typeString(text: string): void {
+    this.getLibnutOrThrow('typeString').typeString(text);
   }
 
   sendKeyViaAppleScript(key: string, modifiers: string[] = []): void {

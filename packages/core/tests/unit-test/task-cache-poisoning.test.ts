@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type LocateCache, TaskCache } from '@/agent';
 import { uuid } from '@midscene/shared/utils';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 
 /**
  * Access internal cache state for testing
@@ -26,6 +26,9 @@ function seedStaleLocate(taskCache: TaskCache, prompt: string, xpath: string) {
 }
 
 describe('locate cache poisoning regression (#2529)', () => {
+  // Keep this regression deterministic. A former web AI e2e version depended on
+  // the model regenerating identical locate prompt text across replans, which
+  // made CI fail before the cache-poisoning branch was actually exercised.
   it('replaces a stale locate entry in place when the consumed hit was rejected', () => {
     const cache = new TaskCache(uuid(), true);
     seedStaleLocate(cache, 'click submit', 'wrong/xpath');

@@ -3,7 +3,7 @@ import type {
   LocateResultElement,
   Size,
 } from '@midscene/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 import { ComputerAgent, RDPDevice, agentForRDPComputer } from '../../../src';
 import type {
   RDPBackendClient,
@@ -13,6 +13,7 @@ import type {
   RDPMouseButtonAction,
   RDPScrollDirection,
 } from '../../../src';
+import { formatRdpServerAddress } from '../../../src/rdp/address';
 
 class FakeRDPBackend implements RDPBackendClient {
   calls: Array<{ name: string; args: unknown[] }> = [];
@@ -21,7 +22,7 @@ class FakeRDPBackend implements RDPBackendClient {
     this.calls.push({ name: 'connect', args: [config] });
     return {
       sessionId: 'session-1',
-      server: `${config.host}:${config.port || 3389}`,
+      server: formatRdpServerAddress(config.host, config.port || 3389),
       size: { width: 1920, height: 1080 },
     };
   }
@@ -114,9 +115,12 @@ describe('@midscene/computer RDP device', () => {
       port: 3389,
       username: 'Admin',
       password: 'secret',
+      localAddress: '10.0.0.20',
       ignoreCertificate: true,
       backend,
       customActions: [],
+      inputStrategy: 'sequential',
+      keyboardTypeDelay: 25,
     });
     await device.connect();
 
@@ -126,13 +130,73 @@ describe('@midscene/computer RDP device', () => {
     // never be serialized into the helper's JSON connection request.
     expect(config).not.toHaveProperty('backend');
     expect(config).not.toHaveProperty('customActions');
+    expect(config).not.toHaveProperty('inputStrategy');
+    expect(config).not.toHaveProperty('keyboardTypeDelay');
     expect(config).toMatchObject({
       host: '10.0.0.3',
       port: 3389,
       username: 'Admin',
       password: 'secret',
+      localAddress: '10.0.0.20',
       ignoreCertificate: true,
     });
+  });
+
+  it('passes localAddress through agentForRDPComputer', async () => {
+    const backend = new FakeRDPBackend();
+    await agentForRDPComputer({
+      host: '10.0.0.4',
+      port: 3389,
+      username: 'Admin',
+      localAddress: '10.0.0.20',
+      backend,
+      generateReport: false,
+    });
+
+    expect(backend.calls[0]).toEqual({
+      name: 'connect',
+      args: [
+        expect.objectContaining({
+          host: '10.0.0.4',
+          localAddress: '10.0.0.20',
+        }),
+      ],
+    });
+  });
+
+  it('normalizes and brackets IPv6 hosts in RDP device metadata', async () => {
+    const backend = new FakeRDPBackend();
+    const device = new RDPDevice({
+      host: '[2001:db8::10]',
+      port: 3390,
+      backend,
+    });
+    await device.connect();
+
+    expect(backend.calls[0]).toEqual({
+      name: 'connect',
+      args: [
+        expect.objectContaining({
+          host: '2001:db8::10',
+          port: 3390,
+        }),
+      ],
+    });
+    expect(device.describe()).toContain('[2001:db8::10]:3390');
+
+    const listDisplays = device
+      .actionSpace()
+      .find((action) => action.name === 'ListDisplays');
+
+    await expect(
+      listDisplays!.call(undefined, mockExecutorContext),
+    ).resolves.toEqual([
+      {
+        id: 'session-1',
+        name: 'RDP [2001:db8::10]:3390 (1920x1080)',
+        primary: true,
+      },
+    ]);
   });
 
   it('allows ComputerAgent to wrap an RDP device directly', async () => {
@@ -210,6 +274,87 @@ describe('@midscene/computer RDP device', () => {
         { name: 'clearInput', args: [] },
         { name: 'typeText', args: ['hello'] },
       ]),
+    );
+  });
+
+  it('types RDP Unicode code points individually with the device delay', async () => {
+    const backend = new FakeRDPBackend();
+    const agent = await agentForRDPComputer({
+      host: '10.0.0.1',
+      keyboardTypeDelay: 1,
+      backend,
+      generateReport: false,
+    });
+
+    await agent.interface.inputPrimitives.keyboard!.typeText('A😀B', {
+      replace: false,
+    });
+
+    expect(backend.calls.filter((call) => call.name === 'typeText')).toEqual([
+      { name: 'typeText', args: ['A'] },
+      { name: 'typeText', args: ['😀'] },
+      { name: 'typeText', args: ['B'] },
+    ]);
+  });
+
+  it('lets an action-level zero disable the RDP device delay', async () => {
+    const backend = new FakeRDPBackend();
+    const device = new RDPDevice({
+      host: '10.0.0.1',
+      keyboardTypeDelay: 80,
+      backend,
+    });
+    await device.connect();
+
+    await device.inputPrimitives.keyboard!.typeText('hello', {
+      replace: false,
+      keyboardTypeDelay: 0,
+    });
+
+    expect(backend.calls.filter((call) => call.name === 'typeText')).toEqual([
+      { name: 'typeText', args: ['hello'] },
+    ]);
+  });
+
+  it('forces sequential RDP backend calls without a positive delay', async () => {
+    const backend = new FakeRDPBackend();
+    const device = new RDPDevice({
+      host: '10.0.0.1',
+      backend,
+      inputStrategy: 'sequential',
+    });
+    await device.connect();
+
+    await device.inputPrimitives.keyboard!.typeText('A😀B', {
+      replace: false,
+    });
+
+    expect(backend.calls.filter((call) => call.name === 'typeText')).toEqual([
+      { name: 'typeText', args: ['A'] },
+      { name: 'typeText', args: ['😀'] },
+      { name: 'typeText', args: ['B'] },
+    ]);
+  });
+
+  it('rejects conflicting bulk input before clearing the RDP field', async () => {
+    const backend = new FakeRDPBackend();
+    const device = new RDPDevice({
+      host: '10.0.0.1',
+      backend,
+      keyboardTypeDelay: 80,
+    });
+    await device.connect();
+
+    await expect(
+      device.inputPrimitives.keyboard!.typeText('hello', {
+        inputStrategy: 'bulk',
+        target: createLocate([10, 20]),
+      }),
+    ).rejects.toThrow(
+      'inputStrategy "bulk" requires keyboardTypeDelay to be omitted or set to 0; use inputStrategy "sequential" for delayed input',
+    );
+    expect(backend.calls.some((call) => call.name === 'clearInput')).toBe(
+      false,
     );
   });
 

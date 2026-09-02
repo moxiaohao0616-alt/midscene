@@ -1,15 +1,14 @@
 import type { StudioRecorderCodeType } from '@shared/electron-contract';
-import { message } from 'antd';
+import { App as AntdApp } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   filterStudioRecorderSessionsForTarget,
   isStudioRecorderSessionForTarget,
 } from '../../recorder/selectors';
-import type { StudioRecordingSession } from '../../recorder/types';
+import type { StudioRecordedEvent } from '../../recorder/types';
 import { useStudioRecorder } from '../../recorder/useStudioRecorder';
 import { RecorderDetailView } from './RecorderDetailView';
 import { RecorderFloatingPanel } from './RecorderFloatingPanel';
-import { RecorderHistoryList } from './RecorderHistoryList';
 import {
   CODE_TYPE_STORAGE_KEY,
   LANGUAGE_STORAGE_KEY,
@@ -18,7 +17,6 @@ import {
   codeTypeLabel,
   createInitialGenerationSteps,
   getAvailableCodeType,
-  getMarkdownOutputLabel,
   isPlaywrightAvailable,
   mergeGenerationProgress,
   platformLabel,
@@ -28,21 +26,20 @@ import {
 import './studio-recorder-panel.css';
 
 interface StudioRecorderPanelProps {
-  onReplayMarkdown?: (session: StudioRecordingSession) => Promise<void>;
-}
-
-async function runPanelAction<T>(action: () => Promise<T>) {
-  try {
-    return await action();
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : 'Recorder failed.');
-    return undefined;
-  }
+  onShowMarkdown?: (options: {
+    markdown: string;
+    onDelete?: () => void | Promise<void>;
+    onDownload?: () => void | Promise<void>;
+    title?: string;
+  }) => void;
+  onShowScreenshots?: (events: StudioRecordedEvent[]) => void;
 }
 
 export function StudioRecorderPanel({
-  onReplayMarkdown,
+  onShowMarkdown,
+  onShowScreenshots,
 }: StudioRecorderPanelProps = {}) {
+  const { message } = AntdApp.useApp();
   const recorder = useStudioRecorder();
   const {
     state,
@@ -52,6 +49,8 @@ export function StudioRecorderPanel({
     startRecording,
     stopRecording,
     deleteSession,
+    deleteSessionCode,
+    renameSession,
     selectSession,
     generateSessionCode,
     exportSessionCode,
@@ -68,9 +67,7 @@ export function StudioRecorderPanel({
   const [selectedLanguage, setSelectedLanguage] = useState(
     readPersistedLanguage,
   );
-  const [showExpandedDetail, setShowExpandedDetail] = useState(false);
-  const [showCollapsed, setShowCollapsed] = useState(false);
-  const [showAllTimelineEvents, setShowAllTimelineEvents] = useState(false);
+  const [timelineCollapsed, setTimelineCollapsed] = useState(false);
   const [isStoppingRecording, setIsStoppingRecording] = useState(false);
   const [generation, setGeneration] = useState<StudioRecorderGenerationState>({
     sessionId: null,
@@ -80,6 +77,19 @@ export function StudioRecorderPanel({
     error: null,
     steps: createInitialGenerationSteps(),
   });
+  const runPanelAction = useCallback(
+    async <T,>(action: () => Promise<T>) => {
+      try {
+        return await action();
+      } catch (error) {
+        message.error(
+          error instanceof Error ? error.message : 'Recorder failed.',
+        );
+        return undefined;
+      }
+    },
+    [message],
+  );
 
   const detailSession = useMemo(() => {
     const selectedSession =
@@ -164,12 +174,15 @@ export function StudioRecorderPanel({
       sessionId: string,
       preferredType: StudioRecorderCodeType = selectedCodeType,
       force = false,
+      showCodeTab = true,
     ) => {
       const session =
         sessions.find((item) => item.id === sessionId) ??
         (currentSession?.id === sessionId ? currentSession : null);
       const type = getAvailableCodeType(session, preferredType);
-      setActiveTab('code');
+      if (showCodeTab) {
+        setActiveTab('code');
+      }
       setSelectedCodeType(type);
       setGeneration({
         sessionId,
@@ -231,7 +244,6 @@ export function StudioRecorderPanel({
             }),
           };
         });
-        message.success(`AI ${codeTypeLabel(type)} generated successfully!`);
         return code;
       } catch (error) {
         setGeneration((current) => {
@@ -262,6 +274,7 @@ export function StudioRecorderPanel({
     [
       currentSession,
       generateSessionCode,
+      message,
       selectedCodeType,
       selectedLanguage,
       sessions,
@@ -273,8 +286,7 @@ export function StudioRecorderPanel({
       selectSession(sessionId);
       setDetailSessionId(sessionId);
       setActiveTab(tab);
-      setShowExpandedDetail(false);
-      setShowCollapsed(false);
+      setTimelineCollapsed(false);
     },
     [selectSession],
   );
@@ -297,6 +309,7 @@ export function StudioRecorderPanel({
     detailSession,
     generation.status,
     runCodeGeneration,
+    runPanelAction,
     state.isRecording,
   ]);
 
@@ -306,7 +319,7 @@ export function StudioRecorderPanel({
     }
     await navigator.clipboard.writeText(activeCode);
     message.success(`${codeLabel} copied to clipboard`);
-  }, [activeCode, codeLabel]);
+  }, [activeCode, codeLabel, message]);
 
   const handleCodeTypeChange = useCallback(
     (nextType: StudioRecorderCodeType) => {
@@ -324,7 +337,7 @@ export function StudioRecorderPanel({
         );
       }
     },
-    [detailSession, runCodeGeneration],
+    [detailSession, runCodeGeneration, runPanelAction],
   );
 
   const handleLanguageChange = useCallback((nextLanguage: string) => {
@@ -338,16 +351,11 @@ export function StudioRecorderPanel({
     generation.status === 'generating' &&
     generation.sessionId === recorderPanelSession?.id &&
     generation.type === 'markdown';
-  const generatedMarkdown =
-    recorderPanelSession?.generatedCode?.markdown ||
-    (generation.sessionId === recorderPanelSession?.id &&
-    generation.type === 'markdown'
-      ? generation.content
-      : '');
-  const markdownOutputLabel = getMarkdownOutputLabel(
-    generatedMarkdown,
-    recorderPanelSession,
-  );
+  const canGenerateMarkdown =
+    Boolean(recorderPanelSession) &&
+    recorderPanelEvents.length > 0 &&
+    !state.isRecording &&
+    !isMarkdownGenerating;
 
   const handleRecorderToggle = useCallback(() => {
     if (state.isRecording) {
@@ -357,27 +365,15 @@ export function StudioRecorderPanel({
       setIsStoppingRecording(true);
       void runPanelAction(async () => {
         const sessionId = currentSession?.id;
-        const generationType = getAvailableCodeType(
-          currentSession,
-          selectedCodeType,
-        );
-        if (sessionId && generationType === 'markdown') {
-          setGeneration({
-            sessionId,
-            type: 'markdown',
-            status: 'generating',
-            content: currentSession?.generatedCode?.markdown || '',
-            error: null,
-            steps: createInitialGenerationSteps(),
-          });
-        }
         try {
           await stopRecording();
         } finally {
           setIsStoppingRecording(false);
         }
         if (sessionId) {
-          await runCodeGeneration(sessionId, generationType, true);
+          setDetailSessionId(sessionId);
+          setActiveTab('timeline');
+          setTimelineCollapsed(false);
         }
       });
       return;
@@ -386,52 +382,19 @@ export function StudioRecorderPanel({
     void runPanelAction(async () => {
       const session = await startRecording();
       if (session) {
-        setShowCollapsed(false);
-        setShowAllTimelineEvents(false);
+        setTimelineCollapsed(false);
         openDetail(session.id);
       }
     });
   }, [
     currentSession?.id,
-    currentSession,
     isStoppingRecording,
     openDetail,
-    runCodeGeneration,
-    selectedCodeType,
+    runPanelAction,
     startRecording,
     state.isRecording,
     stopRecording,
   ]);
-
-  const historyControl = (
-    <RecorderHistoryList
-      currentSessionId={currentSession?.id}
-      isRecording={state.isRecording}
-      onDeleteSession={(sessionId) => {
-        void runPanelAction(async () => {
-          await deleteSession(sessionId);
-          if (detailSessionId === sessionId) {
-            setDetailSessionId(null);
-          }
-        });
-      }}
-      onExportMarkdown={(sessionId) => {
-        void runPanelAction(() => exportSessionCode(sessionId, 'markdown'));
-      }}
-      onOpenDetail={openDetail}
-      sessions={visibleSessions}
-      trigger={
-        <button
-          aria-label="Recording history"
-          className="studio-recorder-floating-tool-button"
-          title="Recording history"
-          type="button"
-        >
-          <span className="studio-recorder-floating-history-icon" />
-        </button>
-      }
-    />
-  );
 
   const detailView = (
     <RecorderDetailView
@@ -481,47 +444,49 @@ export function StudioRecorderPanel({
   return (
     <RecorderFloatingPanel
       canStartRecording={canStartRecording}
+      canGenerateMarkdown={canGenerateMarkdown}
       detailView={detailView}
       error={state.error}
-      generatedMarkdown={generatedMarkdown}
-      historyControl={historyControl}
       isMarkdownGenerating={isMarkdownGenerating}
       isRecording={state.isRecording}
       isStoppingRecording={isStoppingRecording}
-      markdownOutputLabel={markdownOutputLabel}
-      onExportMarkdown={() => {
+      onGenerateMarkdown={() => {
         if (!recorderPanelSession) {
           return;
         }
-        void runPanelAction(() =>
-          exportSessionCode(recorderPanelSession.id, 'markdown'),
-        );
+        const sessionId = recorderPanelSession.id;
+        const sessionName = recorderPanelSession.name;
+        void runPanelAction(async () => {
+          const markdown = await runCodeGeneration(
+            sessionId,
+            'markdown',
+            true,
+            false,
+          );
+          if (markdown) {
+            onShowMarkdown?.({
+              markdown,
+              onDelete: () => deleteSessionCode(sessionId, 'markdown'),
+              onDownload: () => exportSessionCode(sessionId, 'markdown'),
+              title: sessionName,
+            });
+          }
+        });
       }}
-      onReplayMarkdown={
-        onReplayMarkdown && recorderPanelSession
-          ? () => {
-              void runPanelAction(() => onReplayMarkdown(recorderPanelSession));
-            }
-          : undefined
-      }
-      onToggleAllTimelineEvents={() => {
-        setShowAllTimelineEvents((current) => !current);
+      onShowScreenshots={() => {
+        if (!recorderPanelSession) {
+          return;
+        }
+        onShowScreenshots?.(recorderPanelSession.events);
       }}
       onToggleCollapsed={() => {
-        setShowExpandedDetail(false);
-        setShowCollapsed((current) => {
-          if (!current) {
-            setShowAllTimelineEvents(false);
-          }
-          return !current;
-        });
+        setTimelineCollapsed((current) => !current);
       }}
       onToggleRecording={handleRecorderToggle}
       recorderPanelEvents={recorderPanelEvents}
       recorderPanelSession={recorderPanelSession}
-      showAllTimelineEvents={showAllTimelineEvents}
-      showCollapsed={showCollapsed}
-      showExpandedDetail={showExpandedDetail}
+      showExpandedDetail={false}
+      timelineCollapsed={timelineCollapsed}
       statusText={statusText}
     />
   );

@@ -1,10 +1,10 @@
 import type { IModelConfig } from '@midscene/shared/env';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, rs } from '@rstest/core';
 
-const mockCreate = vi.fn();
+const mockCreate = rs.fn();
 
-vi.mock('openai', () => ({
-  default: vi.fn().mockImplementation(() => ({
+rs.mock('openai', () => ({
+  default: rs.fn().mockImplementation(() => ({
     chat: {
       completions: {
         create: mockCreate,
@@ -27,7 +27,7 @@ const baseConfig = (overrides: Partial<IModelConfig> = {}): IModelConfig =>
 
 describe('service-caller request timeout', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    rs.clearAllMocks();
   });
 
   it('resolves default, custom and disabled timeout values', async () => {
@@ -135,6 +135,64 @@ describe('service-caller request timeout', () => {
     }
   });
 
+  it('restores the hard-timeout reason when the OpenAI SDK discards it', async () => {
+    const { callAI } = await import('@/ai-model/service-caller');
+    const { getModelRuntime } = await import('@/ai-model/models');
+    const { isHardTimeoutError } = await import(
+      '@/ai-model/service-caller/request-timeout'
+    );
+
+    mockCreate.mockImplementation((_body, opts) => {
+      const signal = opts?.signal as AbortSignal | undefined;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          // openai@6.3.0 turns an external abort into APIUserAbortError and
+          // loses signal.reason; mirror that behaviour here.
+          reject(new Error('Request was aborted.'));
+        });
+      });
+    });
+
+    try {
+      await callAI(
+        [{ role: 'user', content: 'hello' }],
+        getModelRuntime(baseConfig({ timeout: 30 })),
+      );
+      throw new Error('should have timed out');
+    } catch (err) {
+      expect(err).toMatchObject({
+        message: expect.stringMatching(/AI call hard timeout after 30ms/),
+      });
+      expect(isHardTimeoutError(err)).toBe(true);
+      expect((err as Error).cause).toMatchObject({
+        code: 'AI_CALL_HARD_TIMEOUT',
+        cause: { message: 'Request was aborted.' },
+      });
+    }
+  });
+
+  it('restores the hard-timeout reason for streaming requests too', async () => {
+    const { callAI } = await import('@/ai-model/service-caller');
+    const { getModelRuntime } = await import('@/ai-model/models');
+
+    mockCreate.mockImplementation((_body, opts) => {
+      const signal = opts?.signal as AbortSignal | undefined;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new Error('Request was aborted.'));
+        });
+      });
+    });
+
+    await expect(
+      callAI(
+        [{ role: 'user', content: 'hello' }],
+        getModelRuntime(baseConfig({ timeout: 30 })),
+        { stream: true, onChunk: rs.fn() },
+      ),
+    ).rejects.toThrow(/AI call hard timeout after 30ms/);
+  });
+
   it('uses the 180s default timeout when none is configured', async () => {
     const { callAI } = await import('@/ai-model/service-caller');
     const { getModelRuntime } = await import('@/ai-model/models');
@@ -156,11 +214,51 @@ describe('service-caller request timeout', () => {
     );
 
     const OpenAI = (await import('openai')).default as unknown as ReturnType<
-      typeof vi.fn
+      typeof rs.fn
     >;
     const lastCallOptions = OpenAI.mock.calls.at(-1)?.[0];
     expect(lastCallOptions?.timeout).toBe(180_000);
     expect(lastCallOptions?.maxRetries).toBe(0);
+  });
+
+  it('adds Midscene tracing headers without replacing configured headers', async () => {
+    const { callAI } = await import('@/ai-model/service-caller');
+    const { getModelRuntime } = await import('@/ai-model/models');
+    const { getVersion } = await import('@/utils');
+    const executionId = 'execution-123';
+
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: 'ok' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+
+    const modelRuntime = {
+      ...getModelRuntime(
+        baseConfig({
+          openaiExtraConfig: {
+            defaultHeaders: {
+              'x-provider-header': 'provider-value',
+              'x-midscene-version': 'incorrect-version',
+              'x-midscene-execution-id': 'incorrect-execution-id',
+            },
+          },
+        }),
+      ),
+      executionId,
+    };
+
+    await callAI([{ role: 'user', content: 'hello' }], modelRuntime);
+
+    const OpenAI = (await import('openai')).default as unknown as ReturnType<
+      typeof rs.fn
+    >;
+    const defaultHeaders = OpenAI.mock.calls.at(-1)?.[0]?.defaultHeaders as
+      | Record<string, string>
+      | undefined;
+
+    expect(defaultHeaders?.['x-provider-header']).toBe('provider-value');
+    expect(defaultHeaders?.['x-midscene-version']).toBe(getVersion());
+    expect(defaultHeaders?.['x-midscene-execution-id']).toBe(executionId);
   });
 
   it('retries after a hard timeout and returns the next successful response', async () => {
@@ -193,6 +291,83 @@ describe('service-caller request timeout', () => {
     expect(mockCreate).toHaveBeenCalledTimes(2);
   });
 
+  it('includes previous attempt errors when all retry attempts fail', async () => {
+    const { callAI } = await import('@/ai-model/service-caller');
+    const { getModelRuntime } = await import('@/ai-model/models');
+
+    mockCreate
+      .mockRejectedValueOnce(new Error('first failure'))
+      .mockRejectedValueOnce(new Error('second failure'));
+
+    const promise = callAI(
+      [{ role: 'user', content: 'hello' }],
+      getModelRuntime(baseConfig({ retryCount: 1, retryInterval: 0 })),
+    );
+
+    await expect(promise).rejects.toThrow(/second failure/);
+    await expect(promise).rejects.toThrow(
+      /AI model request failed after 1 retry \(2\/2 attempts\)/,
+    );
+    await expect(promise).rejects.toThrow(/Previous AI call attempt errors/);
+    await expect(promise).rejects.toThrow(/Attempt 1: first failure/);
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+  });
+
+  it('normalizes negative retryCount to zero retries', async () => {
+    const { callAI } = await import('@/ai-model/service-caller');
+    const { getModelRuntime } = await import('@/ai-model/models');
+
+    mockCreate.mockRejectedValueOnce(new Error('single failure'));
+
+    const promise = callAI(
+      [{ role: 'user', content: 'hello' }],
+      getModelRuntime(baseConfig({ retryCount: -1, retryInterval: 0 })),
+    );
+
+    await expect(promise).rejects.toThrow(
+      /AI model request failed after 0 retries \(1\/1 attempts\)/,
+    );
+    await expect(promise).rejects.toThrow(/single failure/);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { retryCount: Number.NaN, expectedRetries: 1, expectedAttempts: 2 },
+    {
+      retryCount: Number.POSITIVE_INFINITY,
+      expectedRetries: 1,
+      expectedAttempts: 2,
+    },
+    { retryCount: 2.9, expectedRetries: 2, expectedAttempts: 3 },
+  ])(
+    'normalizes retryCount $retryCount to $expectedRetries retries',
+    async ({ retryCount, expectedRetries, expectedAttempts }) => {
+      const { callAI } = await import('@/ai-model/service-caller');
+      const { getModelRuntime } = await import('@/ai-model/models');
+
+      for (let i = 1; i <= expectedAttempts; i++) {
+        mockCreate.mockRejectedValueOnce(new Error(`failure ${i}`));
+      }
+
+      const promise = callAI(
+        [{ role: 'user', content: 'hello' }],
+        getModelRuntime(baseConfig({ retryCount, retryInterval: 0 })),
+      );
+
+      await expect(promise).rejects.toThrow(
+        new RegExp(
+          `AI model request failed after ${expectedRetries} ${
+            expectedRetries === 1 ? 'retry' : 'retries'
+          } \\(${expectedAttempts}\\/${expectedAttempts} attempts\\)`,
+        ),
+      );
+      await expect(promise).rejects.toThrow(
+        new RegExp(`failure ${expectedAttempts}`),
+      );
+      expect(mockCreate).toHaveBeenCalledTimes(expectedAttempts);
+    },
+  );
+
   it('disables the hard timeout when modelConfig.timeout is 0', async () => {
     const { callAI } = await import('@/ai-model/service-caller');
     const { getModelRuntime } = await import('@/ai-model/models');
@@ -214,7 +389,7 @@ describe('service-caller request timeout', () => {
     );
 
     const OpenAI = (await import('openai')).default as unknown as ReturnType<
-      typeof vi.fn
+      typeof rs.fn
     >;
     const lastCallOptions = OpenAI.mock.calls.at(-1)?.[0];
     // When timeout is disabled we should NOT forward a timeout to the SDK.

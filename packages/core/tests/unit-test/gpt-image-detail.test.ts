@@ -1,12 +1,12 @@
 import { getModelRuntime } from '@/ai-model/models';
 import { callAI } from '@/ai-model/service-caller';
 import type { IModelConfig } from '@midscene/shared/env';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, rs } from '@rstest/core';
 
-const mockCreate = vi.fn();
+const mockCreate = rs.fn();
 
-vi.mock('openai', () => ({
-  default: vi.fn().mockImplementation(() => ({
+rs.mock('openai', () => ({
+  default: rs.fn().mockImplementation(() => ({
     chat: {
       completions: {
         create: mockCreate,
@@ -172,7 +172,7 @@ describe('GPT image detail handling', () => {
     expect(mockCreate.mock.calls[0][0]).toHaveProperty('temperature', 0.7);
   });
 
-  it('ignores standard model temperature for gpt-5', async () => {
+  it('preserves standard model temperature for gpt-5', async () => {
     await callAI(
       imageMessage,
       getModelRuntime({
@@ -181,9 +181,6 @@ describe('GPT image detail handling', () => {
       }),
     );
 
-    expect(mockCreate.mock.calls[0][0]).toHaveProperty(
-      'temperature',
-      undefined,
-    );
+    expect(mockCreate.mock.calls[0][0]).toHaveProperty('temperature', 0.7);
   });
 });

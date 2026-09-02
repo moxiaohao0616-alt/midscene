@@ -1,22 +1,20 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import * as fs from 'node:fs';
-import {
-  extractJSONFromCodeBlock,
-  safeParseJson,
-} from '@/ai-model/service-caller/json';
+import { locateParamStr } from '@/agent/ui-utils';
 import { dumpActionParam, findAllMidsceneLocatorField } from '@/common';
 import { getMidsceneLocationSchema } from '@/index';
 import { getMidsceneRunSubDir } from '@midscene/shared/common';
 import { uuid } from '@midscene/shared/utils';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, rs } from '@rstest/core';
 import { z } from 'zod';
 import {
-  ifPlanLocateParamHasLocatedPixelBbox,
+  ifLocateParamHasLocatedPixelBbox,
   isPixelBbox,
   transformLogicalElementToScreenshot,
   transformLogicalRectToScreenshotRect,
 } from '../../src/agent/utils';
 import {
+  getReportTpl,
   getTmpDir,
   getTmpFile,
   insertScriptBeforeClosingHtml,
@@ -30,6 +28,25 @@ import {
 } from '../../src/yaml/utils';
 import { getGroupedDumpScriptIds } from './test-helpers/report-html';
 
+import * as fsActual from 'node:fs' with { rstest: 'importActual' };
+
+const { readFileSyncMock } = rs.hoisted(() => ({
+  readFileSyncMock: rs.fn(),
+}));
+
+rs.mock('node:fs', () => {
+  readFileSyncMock.mockImplementation(fsActual.readFileSync);
+
+  return {
+    ...fsActual,
+    default: {
+      ...fsActual,
+      readFileSync: readFileSyncMock,
+    },
+    readFileSync: readFileSyncMock,
+  };
+});
+
 function createTempHtmlFile(content: string): string {
   const filePath = getTmpFile('html');
   if (!filePath) {
@@ -40,6 +57,12 @@ function createTempHtmlFile(content: string): string {
 }
 
 describe('utils', () => {
+  it('rejects an unresolved report template placeholder', () => {
+    readFileSyncMock.mockReturnValueOnce('REPLACE_ME_WITH_REPORT_HTML');
+
+    expect(() => getReportTpl()).toThrow('pnpm exec nx build @midscene/report');
+  });
+
   it('tmpDir', () => {
     const testDir = getTmpDir();
     expect(typeof testDir).toBe('string');
@@ -270,107 +293,20 @@ describe('utils', () => {
   });
 });
 
-describe('extractJSONFromCodeBlock', () => {
-  it('should extract JSON from a direct JSON object', () => {
-    const input = '{ "key": "value" }';
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe('{ "key": "value" }');
-  });
-
-  it('should extract JSON from a code block with json language specifier', () => {
-    const input = '```json\n{ "key": "value" }\n```';
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe('{ "key": "value" }');
-
-    const input2 = '  ```JSON\n{ "key": "value" }\n```';
-    const result2 = extractJSONFromCodeBlock(input2);
-    expect(result2).toBe('{ "key": "value" }');
-  });
-
-  it('should extract JSON from a code block without language specifier', () => {
-    const input = '```\n{ "key": "value" }\n```';
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe('{ "key": "value" }');
-  });
-
-  it('should extract JSON-like structure from text', () => {
-    const input = 'Some text { "key": "value" } more text';
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe('{ "key": "value" }');
-  });
-
-  it('should return the original response if no JSON structure is found', () => {
-    const input = 'This is just plain text';
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe('This is just plain text');
-  });
-
-  it('should handle multi-line JSON objects', () => {
-    const input = `{
-      "key1": "value1",
-      "key2": {
-        "nestedKey": "nestedValue"
-      }
-    }`;
-    const result = extractJSONFromCodeBlock(input);
-    expect(result).toBe(input);
-  });
-
-  it('should handle JSON with point coordinates', () => {
-    const input = '(123,456)';
-    const result = safeParseJson(input);
-    expect(result).toEqual([123, 456]);
-  });
-
-  it('should parse valid JSON string using JSON.parse', () => {
-    const input = '{"key": "value"}';
-    const result = safeParseJson(input);
-    expect(result).toEqual({ key: 'value' });
-  });
-
-  it('should parse dirty JSON using dirty-json parser', () => {
-    const input = "{key: 'value'}"; // Invalid JSON but valid dirty-json
-    const result = safeParseJson(input);
-    expect(result).toEqual({ key: 'value' });
-  });
-
-  it('should throw error for unparseable content', () => {
-    const input = '{foo: true false}';
-    expect(() => safeParseJson(input)).toThrow(
-      /failed to parse LLM response into JSON/,
-    );
-  });
-
-  it('should parse JSON from code block', () => {
-    const input = '```json\n{"key": "value"}\n```';
-    const result = safeParseJson(input);
-    expect(result).toEqual({ key: 'value' });
-  });
-
-  it('should parse complex nested JSON', () => {
-    const input = `{
-      "string": "value",
-      "number": 123,
-      "boolean": true,
-      "array": [1, 2, 3],
-      "object": {
-        "nested": "value"
-      }
-    }`;
-    const result = safeParseJson(input);
-    expect(result).toEqual({
-      string: 'value',
-      number: 123,
-      boolean: true,
-      array: [1, 2, 3],
-      object: {
-        nested: 'value',
-      },
-    });
-  });
-});
-
 describe('buildDetailedLocateParam', () => {
+  it('adds per-call context to the locate prompt', () => {
+    const result = buildDetailedLocateParam('Click the checkout button', {
+      context: 'The current user is a wholesale customer.',
+    });
+
+    expect(result?.prompt).toBe(
+      '<CONTEXT>\nThe current user is a wholesale customer.\n</CONTEXT>\n\n<LOCATE_TARGET>\nClick the checkout button\n</LOCATE_TARGET>',
+    );
+    expect(result?.promptDisplay).toBe('Click the checkout button');
+    expect(result?.context).toBe('The current user is a wholesale customer.');
+    expect(locateParamStr(result)).toBe('Click the checkout button');
+  });
+
   it('merges multimodal locate options into the prompt object', () => {
     const result = buildDetailedLocateParam('Click the icon', {
       images: [
@@ -402,6 +338,20 @@ describe('buildDetailedLocateParam', () => {
 });
 
 describe('buildDetailedLocateParamAndRestParams', () => {
+  it('consumes context without leaking it into action params', () => {
+    const result = buildDetailedLocateParamAndRestParams(
+      'Click the checkout button',
+      {
+        context: 'The current user is a wholesale customer.',
+      },
+    );
+
+    expect(result.locateParam?.prompt).toContain(
+      'The current user is a wholesale customer.',
+    );
+    expect(result.restParams).not.toHaveProperty('context');
+  });
+
   it('does not leak multimodal locate options into rest params', () => {
     const uiContext = {
       screenshot: {
@@ -607,13 +557,11 @@ describe('dumpActionParam', () => {
     const input1 = {
       foo: 'test',
       locator1: {
-        midscene_location_field_flag: true,
         prompt: 'first locator',
         center: [100, 200],
         rect: { left: 50, top: 100, width: 100, height: 50 },
       },
       locator2: {
-        midscene_location_field_flag: true,
         prompt: 'second locator',
         center: [200, 300],
         rect: { left: 150, top: 200, width: 100, height: 50 },
@@ -637,7 +585,6 @@ describe('dumpActionParam', () => {
     const input2 = {
       foo: 'test2',
       locator1: {
-        midscene_location_field_flag: true,
         prompt: 'only locator',
         center: [50, 100],
         rect: { left: 25, top: 50, width: 50, height: 25 },
@@ -662,7 +609,6 @@ describe('dumpActionParam', () => {
 
     const inputWithImages = {
       locator: {
-        midscene_location_field_flag: true,
         prompt: {
           prompt: 'find the button',
           images: [
@@ -684,7 +630,6 @@ describe('dumpActionParam', () => {
 
     const inputWithOneImage = {
       locator: {
-        midscene_location_field_flag: true,
         prompt: {
           prompt: 'find the text',
           images: [{ name: 'text.png', url: 'data:image/png;base64,abc' }],
@@ -703,7 +648,6 @@ describe('dumpActionParam', () => {
 
     const inputWithEmptyImages = {
       locator: {
-        midscene_location_field_flag: true,
         prompt: {
           prompt: 'find the link',
           images: [],
@@ -749,13 +693,11 @@ describe('dumpActionParam', () => {
     const input2 = {
       foo: 'test2',
       locator1: {
-        midscene_location_field_flag: true,
         // missing prompt
         center: [100, 200],
         rect: { left: 50, top: 100, width: 100, height: 50 },
       },
       locator2: {
-        midscene_location_field_flag: true,
         prompt: 'valid locator',
         center: [200, 300],
         rect: { left: 150, top: 200, width: 100, height: 50 },
@@ -771,7 +713,6 @@ describe('dumpActionParam', () => {
             100,
             200,
           ],
-          "midscene_location_field_flag": true,
           "rect": {
             "height": 50,
             "left": 50,
@@ -848,7 +789,7 @@ describe('dumpActionParam', () => {
   });
 });
 
-describe('ifPlanLocateParamHasLocatedPixelBbox', () => {
+describe('ifLocateParamHasLocatedPixelBbox', () => {
   it('should return true when locatedPixelBbox is valid array with 4 elements', () => {
     const param = {
       prompt: 'test element',
@@ -859,14 +800,14 @@ describe('ifPlanLocateParamHasLocatedPixelBbox', () => {
         number,
       ],
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param)).toBe(true);
+    expect(ifLocateParamHasLocatedPixelBbox(param)).toBe(true);
   });
 
   it('should return false when locatedPixelBbox is undefined', () => {
     const param = {
       prompt: 'test element',
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param)).toBe(false);
   });
 
   it('should return false when locatedPixelBbox is not an array', () => {
@@ -874,7 +815,7 @@ describe('ifPlanLocateParamHasLocatedPixelBbox', () => {
       prompt: 'test element',
       locatedPixelBbox: 'not an array' as any,
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param)).toBe(false);
   });
 
   it('should return false when locatedPixelBbox array length is not 4', () => {
@@ -882,19 +823,19 @@ describe('ifPlanLocateParamHasLocatedPixelBbox', () => {
       prompt: 'test element',
       locatedPixelBbox: [100, 200] as any,
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param1)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param1)).toBe(false);
 
     const param2 = {
       prompt: 'test element',
       locatedPixelBbox: [100, 200, 300] as any,
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param2)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param2)).toBe(false);
 
     const param3 = {
       prompt: 'test element',
       locatedPixelBbox: [100, 200, 300, 400, 500] as any,
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param3)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param3)).toBe(false);
   });
 
   it('should return false when locatedPixelBbox is null', () => {
@@ -902,18 +843,18 @@ describe('ifPlanLocateParamHasLocatedPixelBbox', () => {
       prompt: 'test element',
       locatedPixelBbox: null as any,
     };
-    expect(ifPlanLocateParamHasLocatedPixelBbox(param)).toBe(false);
+    expect(ifLocateParamHasLocatedPixelBbox(param)).toBe(false);
   });
 
   it('should return false when locatedPixelBbox contains non-finite or non-number values', () => {
     expect(
-      ifPlanLocateParamHasLocatedPixelBbox({
+      ifLocateParamHasLocatedPixelBbox({
         prompt: 'test element',
         locatedPixelBbox: [100, Number.NaN, 300, 400] as any,
       }),
     ).toBe(false);
     expect(
-      ifPlanLocateParamHasLocatedPixelBbox({
+      ifLocateParamHasLocatedPixelBbox({
         prompt: 'test element',
         locatedPixelBbox: [100, '200', 300, 400] as any,
       }),

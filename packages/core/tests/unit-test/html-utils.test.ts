@@ -1,15 +1,116 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 import {
+  collectImageScriptIds,
   extractImageByIdSync,
   extractLastDumpScriptSync,
+  generateAgentReportComment,
   generateImageScriptTag,
   streamImageScriptsToFile,
 } from '../../src/dump/html-utils';
 import { getTmpFile } from '../../src/utils';
 
 describe('html-utils', () => {
+  it('keeps report-bundled sources free of raw script close tokens', () => {
+    const unsafeCloseTag = [String.fromCharCode(60), '/script>'].join('');
+    const bundledSourceFiles = [
+      join(__dirname, '../../src/dump/html-utils.ts'),
+      join(__dirname, '../../src/utils.ts'),
+    ];
+
+    for (const sourceFile of bundledSourceFiles) {
+      const source = readFileSync(sourceFile, 'utf8');
+      expect(source).not.toContain(unsafeCloseTag);
+    }
+  });
+
+  it('generates a compact agent analysis comment for report HTML', () => {
+    const comment = generateAgentReportComment({
+      sdkVersion: '1.0.0',
+      groupName: 'checkout -- flow',
+      modelBriefs: [
+        {
+          intent: 'planning',
+          name: 'gpt-4o',
+          modelDescription: 'vision planner',
+        },
+      ],
+      executions: [
+        {
+          logTime: 1710000000000,
+          name: 'exec',
+          tasks: [
+            {
+              taskId: 'task-1',
+              type: 'Action Space',
+              subType: 'Tap',
+              status: 'finished',
+              executor: async () => {},
+            } as any,
+          ],
+        },
+      ],
+    });
+
+    expect(comment).toContain('For Agent Analysis');
+    expect(comment).toContain('script[type="midscene_web_dump"]');
+    expect(comment).toContain('script[type="midscene-image"]');
+    expect(comment).toContain('planning: gpt-4o (vision planner)');
+    expect(comment).toContain('checkout - - flow');
+    expect(comment).not.toContain('checkout -- flow');
+  });
+
+  it('falls back agent comment model info to task usage', () => {
+    const comment = generateAgentReportComment({
+      sdkVersion: '1.0.0',
+      groupName: 'usage model report',
+      modelBriefs: [],
+      executions: [
+        {
+          logTime: 1710000000000,
+          name: 'exec',
+          tasks: [
+            {
+              taskId: 'task-1',
+              type: 'Planning',
+              subType: 'Plan',
+              status: 'finished',
+              usage: {
+                intent: 'planning',
+                model_name: 'openai_qwen3.5-plus',
+                model_description: 'qwen3.5 mode',
+              },
+              executor: async () => {},
+            } as any,
+          ],
+        },
+      ],
+    });
+
+    expect(comment).toContain(
+      'Models: planning: openai_qwen3.5-plus (qwen3.5 mode)',
+    );
+    expect(comment).not.toContain('No report-level model metadata recorded');
+  });
+
+  it('keeps agent analysis comments optional for incomplete execution dumps', () => {
+    const comment = generateAgentReportComment({
+      sdkVersion: '1.0.0',
+      groupName: 'incomplete report',
+      modelBriefs: [],
+      executions: [
+        {
+          logTime: 1710000000000,
+          name: 'exec',
+        } as any,
+      ],
+    });
+
+    expect(comment).toContain('Executions: 1; Tasks: 0');
+    expect(comment).toContain('Models: No model metadata recorded');
+  });
+
   describe('extractImageByIdSync', () => {
     const fixturesDir = join(__dirname, '../fixtures/report-samples');
     const inlineSamplePath = join(fixturesDir, 'inline-sample.html');
@@ -185,6 +286,26 @@ test
     });
   });
 
+  it('collects inline image IDs asynchronously across streaming chunks', async () => {
+    const htmlPath = getTmpFile('html');
+    if (!htmlPath) throw new Error('Failed to create temp html file');
+    const chunkBoundaryPadding = 'x'.repeat(64 * 1024 - 20);
+    writeFileSync(
+      htmlPath,
+      [
+        chunkBoundaryPadding,
+        generateImageScriptTag('first-image', 'data:image/png;base64,AAA'),
+        generateImageScriptTag('second-image', 'data:image/png;base64,BBB'),
+      ].join('\n'),
+      'utf8',
+    );
+
+    await expect(collectImageScriptIds(htmlPath)).resolves.toEqual(
+      new Set(['first-image', 'second-image']),
+    );
+    unlinkSync(htmlPath);
+  });
+
   describe('streamImageScriptsToFile', () => {
     it('should stream image scripts from source to destination', () => {
       const srcPath = getTmpFile('html');
@@ -226,6 +347,42 @@ ${imageTag2}
       expect(destContent).toContain('BBB');
 
       unlinkSync(srcPath);
+      unlinkSync(destPath);
+    });
+
+    it('should deduplicate image IDs across streamed reports', () => {
+      const firstSrcPath = getTmpFile('html');
+      const secondSrcPath = getTmpFile('html');
+      const destPath = getTmpFile('html');
+      if (!firstSrcPath || !secondSrcPath || !destPath) {
+        throw new Error('Failed to create temp files');
+      }
+
+      const sharedImage = generateImageScriptTag(
+        'shared-image',
+        'data:image/png;base64,AAA',
+      );
+      const uniqueImage = generateImageScriptTag(
+        'unique-image',
+        'data:image/png;base64,BBB',
+      );
+      writeFileSync(firstSrcPath, sharedImage, 'utf8');
+      writeFileSync(secondSrcPath, `${sharedImage}\n${uniqueImage}`, 'utf8');
+      writeFileSync(destPath, '', 'utf8');
+
+      const writtenImageIds = new Set<string>();
+      streamImageScriptsToFile(firstSrcPath, destPath, writtenImageIds);
+      streamImageScriptsToFile(secondSrcPath, destPath, writtenImageIds);
+
+      const destContent = readFileSync(destPath, 'utf8');
+      expect(destContent.split('data-id="shared-image"')).toHaveLength(2);
+      expect(destContent.split('data-id="unique-image"')).toHaveLength(2);
+      expect(writtenImageIds).toEqual(
+        new Set(['shared-image', 'unique-image']),
+      );
+
+      unlinkSync(firstSrcPath);
+      unlinkSync(secondSrcPath);
       unlinkSync(destPath);
     });
 

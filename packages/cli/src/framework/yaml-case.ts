@@ -14,6 +14,8 @@ import merge from 'lodash.merge';
 import { createYamlPlayer } from '../create-yaml-player';
 
 export interface RunYamlCaseGlobalConfig {
+  page?: Partial<MidsceneYamlScriptWebEnv>;
+  browser?: Partial<MidsceneYamlScriptWebEnv>;
   web?: Partial<MidsceneYamlScriptWebEnv>;
   android?: Partial<MidsceneYamlScriptAndroidEnv>;
   ios?: Partial<MidsceneYamlScriptIOSEnv>;
@@ -27,6 +29,12 @@ export interface RunYamlCaseOptions {
   headed?: boolean;
   keepWindow?: boolean;
 }
+
+/** @internal Used by the Rstest worker to forward player state snapshots. */
+export type YamlPlayerSnapshotHandler = (context: {
+  file: string;
+  player: ScriptPlayer<MidsceneYamlScriptEnv>;
+}) => void;
 
 export interface RunYamlCaseResult {
   file: string;
@@ -156,9 +164,10 @@ export const createYamlCaseFailure = (
   );
 };
 
-export async function runYamlCaseResult(
+const executeYamlCaseResult = async (
   options: RunYamlCaseOptions,
-): Promise<MidsceneYamlConfigResult> {
+  onPlayerSnapshot?: YamlPlayerSnapshotHandler,
+): Promise<MidsceneYamlConfigResult> => {
   const file = resolve(options.file);
   const startTime = Date.now();
   const executionConfig =
@@ -171,9 +180,32 @@ export async function runYamlCaseResult(
     keepWindow: options.keepWindow,
   });
 
-  await player.run();
+  const reportSnapshot = () => {
+    onPlayerSnapshot?.({ file, player });
+  };
+
+  reportSnapshot();
+  try {
+    await player.run();
+  } finally {
+    reportSnapshot();
+  }
 
   return createYamlCaseResult(file, player, Date.now() - startTime);
+};
+
+/** @internal Used by the generated Rstest entry to observe player state. */
+export function runYamlCaseResultWithSnapshots(
+  options: RunYamlCaseOptions,
+  onPlayerSnapshot: YamlPlayerSnapshotHandler,
+): Promise<MidsceneYamlConfigResult> {
+  return executeYamlCaseResult(options, onPlayerSnapshot);
+}
+
+export function runYamlCaseResult(
+  options: RunYamlCaseOptions,
+): Promise<MidsceneYamlConfigResult> {
+  return executeYamlCaseResult(options);
 }
 
 export async function runYamlCase(

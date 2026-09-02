@@ -8,10 +8,11 @@ export const MIDSCENE_DEBUG_MODEL_RESPONSE = 'MIDSCENE_DEBUG_MODEL_RESPONSE';
 export const MIDSCENE_DANGEROUSLY_PRINT_ALL_CONFIG =
   'MIDSCENE_DANGEROUSLY_PRINT_ALL_CONFIG';
 export const MIDSCENE_DEBUG_MODE = 'MIDSCENE_DEBUG_MODE';
-export const MIDSCENE_MCP_USE_PUPPETEER_MODE =
-  'MIDSCENE_MCP_USE_PUPPETEER_MODE';
+export const MIDSCENE_CHROME_PATH = 'MIDSCENE_CHROME_PATH';
+/**
+ * @deprecated Use MIDSCENE_CHROME_PATH instead. This is kept for backward compatibility.
+ */
 export const MIDSCENE_MCP_CHROME_PATH = 'MIDSCENE_MCP_CHROME_PATH';
-export const MIDSCENE_MCP_ANDROID_MODE = 'MIDSCENE_MCP_ANDROID_MODE';
 export const DOCKER_CONTAINER = 'DOCKER_CONTAINER';
 
 // Observability
@@ -34,6 +35,10 @@ export const MIDSCENE_MODEL_REASONING_ENABLED =
   'MIDSCENE_MODEL_REASONING_ENABLED';
 export const MIDSCENE_MODEL_REASONING_BUDGET =
   'MIDSCENE_MODEL_REASONING_BUDGET';
+export const MIDSCENE_MODEL_RESPONSE_FORMAT = 'MIDSCENE_MODEL_RESPONSE_FORMAT';
+
+export type TModelReasoningEnabled = boolean | 'default';
+export type TModelResponseFormat = 'none' | 'auto';
 
 /**
  * @deprecated Use MIDSCENE_MODEL_API_KEY instead. This is kept for backward compatibility.
@@ -60,6 +65,8 @@ export const MIDSCENE_ADB_PATH = 'MIDSCENE_ADB_PATH';
 export const MIDSCENE_ADB_REMOTE_HOST = 'MIDSCENE_ADB_REMOTE_HOST';
 export const MIDSCENE_ADB_REMOTE_PORT = 'MIDSCENE_ADB_REMOTE_PORT';
 export const MIDSCENE_ANDROID_IME_STRATEGY = 'MIDSCENE_ANDROID_IME_STRATEGY';
+export const MIDSCENE_ANDROID_SCREENSHOT_STRATEGY =
+  'MIDSCENE_ANDROID_SCREENSHOT_STRATEGY';
 
 export const MIDSCENE_IOS_DEVICE_UDID = 'MIDSCENE_IOS_DEVICE_UDID';
 export const MIDSCENE_IOS_SIMULATOR_UDID = 'MIDSCENE_IOS_SIMULATOR_UDID';
@@ -86,6 +93,7 @@ export const MIDSCENE_REPLANNING_CYCLE_LIMIT =
   'MIDSCENE_REPLANNING_CYCLE_LIMIT';
 
 export const MIDSCENE_RUN_DIR = 'MIDSCENE_RUN_DIR';
+export const MIDSCENE_RECORD_MODEL_CALL = 'MIDSCENE_RECORD_MODEL_CALL';
 
 // INSIGHT (unified VQA and Grounding)
 export const MIDSCENE_INSIGHT_MODEL_NAME = 'MIDSCENE_INSIGHT_MODEL_NAME';
@@ -114,6 +122,8 @@ export const MIDSCENE_INSIGHT_MODEL_REASONING_ENABLED =
   'MIDSCENE_INSIGHT_MODEL_REASONING_ENABLED';
 export const MIDSCENE_INSIGHT_MODEL_REASONING_BUDGET =
   'MIDSCENE_INSIGHT_MODEL_REASONING_BUDGET';
+export const MIDSCENE_INSIGHT_MODEL_RESPONSE_FORMAT =
+  'MIDSCENE_INSIGHT_MODEL_RESPONSE_FORMAT';
 
 // PLANNING
 export const MIDSCENE_PLANNING_MODEL_NAME = 'MIDSCENE_PLANNING_MODEL_NAME';
@@ -144,6 +154,8 @@ export const MIDSCENE_PLANNING_MODEL_REASONING_ENABLED =
   'MIDSCENE_PLANNING_MODEL_REASONING_ENABLED';
 export const MIDSCENE_PLANNING_MODEL_REASONING_BUDGET =
   'MIDSCENE_PLANNING_MODEL_REASONING_BUDGET';
+export const MIDSCENE_PLANNING_MODEL_RESPONSE_FORMAT =
+  'MIDSCENE_PLANNING_MODEL_RESPONSE_FORMAT';
 export const MIDSCENE_MODEL_FAMILY = 'MIDSCENE_MODEL_FAMILY';
 
 /**
@@ -160,12 +172,11 @@ export const BASIC_ENV_KEYS = [
   MIDSCENE_DEBUG_MODEL_PROFILE,
   MIDSCENE_DEBUG_MODEL_RESPONSE,
   MIDSCENE_RUN_DIR,
+  MIDSCENE_RECORD_MODEL_CALL,
 ] as const;
 
 export const BOOLEAN_ENV_KEYS = [
   MIDSCENE_CACHE,
-  MIDSCENE_MCP_USE_PUPPETEER_MODE,
-  MIDSCENE_MCP_ANDROID_MODE,
   MIDSCENE_LANGSMITH_DEBUG,
   MIDSCENE_LANGFUSE_DEBUG,
   MIDSCENE_REPORT_QUIET,
@@ -181,11 +192,13 @@ export const STRING_ENV_KEYS = [
   MIDSCENE_ADB_REMOTE_HOST,
   MIDSCENE_ADB_REMOTE_PORT,
   MIDSCENE_ANDROID_IME_STRATEGY,
+  MIDSCENE_ANDROID_SCREENSHOT_STRATEGY,
   MIDSCENE_IOS_DEVICE_UDID,
   MIDSCENE_IOS_SIMULATOR_UDID,
   MIDSCENE_REPORT_TAG_NAME,
   MIDSCENE_PREFERRED_LANGUAGE,
   MATCH_BY_POSITION,
+  MIDSCENE_CHROME_PATH,
   MIDSCENE_MCP_CHROME_PATH,
   DOCKER_CONTAINER,
 ] as const;
@@ -222,6 +235,7 @@ export const MODEL_ENV_KEYS = [
   MIDSCENE_MODEL_REASONING_EFFORT,
   MIDSCENE_MODEL_REASONING_ENABLED,
   MIDSCENE_MODEL_REASONING_BUDGET,
+  MIDSCENE_MODEL_RESPONSE_FORMAT,
   MIDSCENE_USE_VLM_UI_TARS,
   MIDSCENE_USE_QWEN_VL,
   MIDSCENE_USE_QWEN3_VL,
@@ -250,6 +264,7 @@ export const MODEL_ENV_KEYS = [
   MIDSCENE_INSIGHT_MODEL_REASONING_EFFORT,
   MIDSCENE_INSIGHT_MODEL_REASONING_ENABLED,
   MIDSCENE_INSIGHT_MODEL_REASONING_BUDGET,
+  MIDSCENE_INSIGHT_MODEL_RESPONSE_FORMAT,
   // PLANNING
   MIDSCENE_PLANNING_MODEL_NAME,
   MIDSCENE_PLANNING_MODEL_SOCKS_PROXY,
@@ -266,6 +281,7 @@ export const MODEL_ENV_KEYS = [
   MIDSCENE_PLANNING_MODEL_REASONING_EFFORT,
   MIDSCENE_PLANNING_MODEL_REASONING_ENABLED,
   MIDSCENE_PLANNING_MODEL_REASONING_BUDGET,
+  MIDSCENE_PLANNING_MODEL_RESPONSE_FORMAT,
   MIDSCENE_MODEL_FAMILY,
 ] as const;
 
@@ -297,7 +313,11 @@ export type TModelFamily =
   | 'glm-v'
   | 'auto-glm'
   | 'auto-glm-multilingual'
-  | 'gpt-5';
+  | 'gpt-5'
+  | 'deepseek'
+  | 'kimi'
+  | 'kimi3'
+  | 'xiaomi-mimo';
 
 export const MODEL_FAMILY_VALUES: TModelFamily[] = [
   'doubao-vision',
@@ -315,6 +335,10 @@ export const MODEL_FAMILY_VALUES: TModelFamily[] = [
   'auto-glm',
   'auto-glm-multilingual',
   'gpt-5',
+  'deepseek',
+  'kimi',
+  'kimi3',
+  'xiaomi-mimo',
 ];
 
 export interface IModelConfigForInsight {
@@ -380,10 +404,12 @@ export interface IModelConfigForDefault {
   [MIDSCENE_MODEL_TEMPERATURE]?: string;
   // reasoning effort
   [MIDSCENE_MODEL_REASONING_EFFORT]?: string;
-  // enable reasoning (boolean as string)
+  // enable reasoning (boolean/default as string)
   [MIDSCENE_MODEL_REASONING_ENABLED]?: string;
   // reasoning budget (number as string)
   [MIDSCENE_MODEL_REASONING_BUDGET]?: string;
+  // Response format strategy (none/auto)
+  [MIDSCENE_MODEL_RESPONSE_FORMAT]?: TModelResponseFormat;
 }
 
 export interface IModelConfigForDefaultLegacy {
@@ -484,6 +510,8 @@ export interface IModelConfig {
   /**
    * Number of retries when AI call fails.
    * Default is 1 (retry once after failure).
+   * Retries occur on HTTP errors or when the model response cannot be
+   * structurally parsed.
    */
   retryCount?: number;
   /**
@@ -499,13 +527,19 @@ export interface IModelConfig {
   /**
    * Enable/disable reasoning for the model.
    * Passed through to model-family-specific parameters (e.g., enable_thinking for qwen, thinking.type for doubao/glm-v).
+   * "default" means following the model provider's default without sending reasoning controls.
    */
-  reasoningEnabled?: boolean;
+  reasoningEnabled?: TModelReasoningEnabled;
   /**
    * Reasoning token budget for the model.
    * Passed through to model-family-specific parameters (e.g., thinking_budget for qwen).
    */
   reasoningBudget?: number;
+  /**
+   * Response format strategy. "auto" lets the model adapter enable a
+   * provider-supported structured response format for eligible intents.
+   */
+  responseFormat?: TModelResponseFormat;
   /**
    * Model family - unified model configuration
    * Maps directly to model families like 'qwen2.5-vl', 'qwen3-vl', 'doubao-vision', 'doubao-seed', etc.

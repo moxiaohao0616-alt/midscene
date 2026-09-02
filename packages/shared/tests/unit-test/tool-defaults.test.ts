@@ -3,8 +3,8 @@ import {
   mergeToolDefaults,
   resolveToolDefaults,
   stripBehaviorFlags,
-} from '@/mcp/tool-defaults';
-import { describe, expect, it } from 'vitest';
+} from '@/agent-tools/tool-defaults';
+import { describe, expect, it } from '@rstest/core';
 
 describe('mergeToolDefaults', () => {
   it('merges locate and act bags with b winning', () => {

@@ -5,7 +5,7 @@ Midscene.js Computer Desktop Automation - AI-powered desktop automation for:
 - local desktop control on Windows, macOS, and Linux
 - remote Windows desktop control over the RDP protocol
 
-See <https://midscenejs.com/computer-introduction.html>.
+See <https://midscenejs.com/platforms/desktop>.
 
 ## RDP support
 
@@ -18,6 +18,19 @@ const agent = await agentForRDPComputer({
   host: '10.0.0.10',
   username: 'Admin',
   password: 'secret',
+  ignoreCertificate: true,
+});
+```
+
+When the machine running Midscene has multiple outbound routes, pass
+`localAddress` to bind the RDP TCP connection to a specific local source IP:
+
+```ts
+const agent = await agentForRDPComputer({
+  host: '10.0.0.10',
+  username: 'Admin',
+  password: 'secret',
+  localAddress: '10.0.0.20',
   ignoreCertificate: true,
 });
 ```

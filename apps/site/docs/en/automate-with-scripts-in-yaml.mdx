@@ -9,7 +9,7 @@ Midscene offers a way to perform automation using `.yaml` files, which helps you
 Here is an example. By reading its content, you should be able to understand how it works.
 
 ```yaml
-web:
+page:
   url: https://www.bing.com
 
 tasks:
@@ -33,6 +33,8 @@ You can find a sample project that uses YAML scripts for automation here:
 
 :::
 
+## Set up API keys for model
+
 <SetupEnv />
 
 To execute YAML workflows from the command line, install the Midscene CLI. See [YAML script runner](./yaml-script-runner) for installation guidance, `.env` usage, and details on the `midscene` runner.
@@ -41,10 +43,10 @@ To execute YAML workflows from the command line, install the Midscene CLI. See [
 
 Script files use YAML format to describe automation tasks. It defines the target to be manipulated (like a webpage or an Android app) and the series of steps to perform.
 
-A standard `.yaml` script file includes a `web`, `android`, `ios`, `harmony`, or `computer` section to configure the environment, an optional `agent` section to configure AI agent behavior, and a `tasks` section to define the automation tasks.
+A standard `.yaml` script file includes a `page`, `browser`, `web`, `android`, `ios`, `harmony`, or `computer` section to configure the environment, an optional `agent` section to configure AI agent behavior, and a `tasks` section to define the automation tasks.
 
 ```yaml
-web:
+page:
   url: https://www.bing.com
 
 # The tasks section defines the series of steps to be executed
@@ -56,6 +58,7 @@ tasks:
       - aiAssert: The results show weather information
 ```
 
+Use `page:` for a page-level Agent. Use `browser:` when one Agent should manage a browser and its active page. `web:` remains supported as a compatibility entry; `web.mode: browser` maps to BrowserAgent and plain `web:` maps to PageAgent. Do not combine `page`, `browser`, `web`, or the deprecated `target` in the same script.
 
 ### The `agent` part
 
@@ -97,7 +100,7 @@ agent:
     id: <string>
 ```
 
-:::tip Agent Configuration Notes
+:::info Agent Configuration Notes
 
 - **Applicable environments**: Web, iOS, and Android environments all support `agent` configuration
 - **testId priority**: CLI parameter > YAML agent.testId > filename
@@ -141,10 +144,36 @@ tasks:
 ```
 
 
-### The `web` part
+### The web target part
+
+Recommended page-level target:
+
+```yaml
+page:
+  url: https://example.com
+```
+
+Recommended browser-level target:
+
+```yaml
+browser:
+  url: https://example.com
+  autoFollowNewPage: true
+```
+
+Compatibility form:
 
 ```yaml
 web:
+  mode: browser
+  url: https://example.com
+  autoFollowNewPage: true
+```
+
+Shared options:
+
+```yaml
+page:
   # The URL to visit, required. If `serve` is provided, provide the relative path.
   url: <url>
 
@@ -165,6 +194,11 @@ web:
 
   # Path to a JSON format browser cookie file, optional.
   cookie: <path-to-cookie-file>
+
+  # Chrome download directory (Puppeteer only), optional.
+  # Relative paths are resolved from the current working directory.
+  # Not supported in bridge mode.
+  downloadPath: <path-to-download-directory>
 
   # Extra HTTP headers sent with every request (Puppeteer only), optional.
   # Useful when the server validates custom request headers.
@@ -190,7 +224,12 @@ web:
   unstableLogContent: <boolean | path-to-unstable-log-file>
 
   # Whether to restrict page navigation to the current tab, optional, defaults to true.
+  # Page mode only. Do not use it with `browser:` or `web.mode: browser`.
   forceSameTabNavigation: <boolean>
+
+  # Whether BrowserAgent should automatically continue in newly opened pages, optional, defaults to false.
+  # Browser mode only. Use `browser:` or `web.mode: browser`.
+  autoFollowNewPage: <boolean>
 
   # CDP endpoint, optional. Connects to an existing browser instance via CDP instead of launching a new one.
   # Mutually exclusive with bridgeMode.
@@ -231,13 +270,13 @@ android:
   # All other options supported by the AndroidDevice constructor
   # For example: androidAdbPath, remoteAdbHost, remoteAdbPort,
   # imeStrategy, displayId, autoDismissKeyboard, keyboardDismissStrategy,
-  # minScreenshotBufferSize, alwaysRefreshScreenInfo, etc.
+  # keyboardTypeDelay, minScreenshotBufferSize, alwaysRefreshScreenInfo, etc.
   # See the AndroidDevice constructor documentation for the complete list
 ```
 
-:::tip View Complete Android Configuration Options
+:::info View Complete Android Configuration Options
 
-YAML scripts now support all configuration options from the `AndroidDevice` constructor. For the complete list of options, please refer to [AndroidDevice Constructor in Android Integration Documentation](./android-getting-started#androiddevice-constructor).
+YAML scripts now support all configuration options from the `AndroidDevice` constructor. For the complete list of options, see [`AndroidDevice`](./reference/#androiddevice) in the Android API reference.
 
 :::
 
@@ -336,9 +375,9 @@ ios:
   # See the IOSDevice constructor documentation for the complete list
 ```
 
-:::tip View Complete iOS Configuration Options
+:::info View Complete iOS Configuration Options
 
-YAML scripts now support all configuration options from the `IOSDevice` constructor. For the complete list of options, please refer to [IOSDevice constructor in the iOS API reference](./ios-api-reference#iosdevice-constructor).
+YAML scripts now support all configuration options from the `IOSDevice` constructor. For the complete list of options, see [`IOSDevice`](./reference/#iosdevice) in the iOS API reference.
 
 :::
 
@@ -431,9 +470,10 @@ harmony:
   # Whether to auto dismiss keyboard after input, optional, defaults to false.
   autoDismissKeyboard: <boolean>
 
-  # Custom mapping of app names to bundle names, optional. User-provided mappings take precedence over defaults.
+  # Custom mapping of app names to bundle names or explicit bundle/ability targets, optional.
+  # User-provided mappings take precedence over defaults.
   appNameMapping:
-    <app-name>: <bundle-name>
+    <app-name>: <bundle-name-or-bundle/ability>
 
   # The path to the JSON file for outputting aiQuery/aiAssert results, optional.
   output: <path-to-output-file>
@@ -445,16 +485,18 @@ harmony:
 
 **`launch` - Launch App**
 
-Launch a HarmonyOS app by its bundle name.
+Launch a HarmonyOS app by its bundle name or an explicit `bundle/Ability` target.
 
 ```yaml
 harmony:
   deviceId: 'test-device'
+  appNameMapping:
+    Video: com.example.video/PhoneAbility
 
 tasks:
   - name: Launch app
     flow:
-      - launch: com.example.app
+      - launch: Video
 ```
 
 **`terminate` - Terminate App**
@@ -519,7 +561,7 @@ tasks:
       - aiAssert: The results show weather information
 ```
 
-:::tip Platform Notes
+:::info Platform Notes
 
 The demo scripts above use macOS commands. For Windows, modify the scripts to use:
 - `press Windows key` instead of `press Cmd+Space`
@@ -532,7 +574,7 @@ The demo scripts above use macOS commands. For Windows, modify the scripts to us
 
 The `tasks` part is an array that defines the steps of the script. Remember to add a `-` before each step to indicate it's an array item.
 
-The interfaces in the `flow` section are almost identical to the [API](./api.html), with some differences in parameter nesting levels.
+The interfaces in the `flow` section are almost identical to the [API](./reference/#common), with some differences in parameter nesting levels.
 
 ```yaml
 tasks:
@@ -617,6 +659,16 @@ tasks:
         errorMessage: <error-message> # Optional, the error message to print if the assertion fails.
         name: <name> # Optional, give the assertion a name, which will be used as a key in the JSON output.
 
+      - aiBoolean: <prompt>
+        name: <name> # Optional, give the boolean result a name for JSON output.
+
+      # Run one Gherkin Scenario. This is a Beta feature available starting in Midscene 1.10.
+      - runGherkinScenario: |
+          Scenario: Add a todo item
+            Given the todo page is open
+            When I add a todo item named "Buy milk"
+            Then the todo list should contain "Buy milk"
+
       # Wait for a specified amount of time.
       - sleep: <ms>
 
@@ -628,6 +680,8 @@ tasks:
     flow:
       # ...
 ```
+
+`runGherkinScenario` is a Beta feature available starting in Midscene 1.10. For supported rules and limitations, see [BDD-style scripts with Gherkin](./advanced/bdd-style-scripts-with-gherkin).
 
 #### Step Result Names
 
@@ -680,11 +734,12 @@ Notes:
 - `fileChooserAccept` is only available for web pages (Playwright, Puppeteer, or Chrome extension Bridge mode).
 - Relative paths are resolved from the current command working directory, not from the YAML file directory.
 - If a file does not exist, the script throws before the tap is executed.
+- In Chrome extension Bridge mode, local file uploads require the Midscene extension's "Allow access to file URLs" permission. Enable it in `chrome://extensions` > Midscene > "Details", then reconnect Bridge mode from the target `http(s)://` page.
 - Chrome extension Bridge mode does not support directory upload inputs (`webkitdirectory` / `directory`). Use Playwright for directory uploads.
 
 #### Prompting with images
 
-For steps whose prompt accepts images, you can attach images to the prompt by setting the `images` field to an array of objects, each containing a `name` and a `url`. (see the [API reference](./api#prompting-with-images)), replace the string value with an object that contains:
+For steps whose prompt accepts images, you can attach images to the prompt by setting the `images` field to an array of objects, each containing a `name` and a `url`. (see the [API reference](./reference/#prompting-with-images)), replace the string value with an object that contains:
 
 - `prompt`: The text prompt.
 - `images`: (Optional) The reference images used in the prompt. Each image needs a `name` and a `url`.
@@ -717,7 +772,7 @@ tasks:
 
 > The legacy nested format (where `locate` is indented under the action key, e.g. `aiTap: \n    locate: ...`) is still supported but not recommended.
 
-For insight steps like `aiAsk`, `aiQuery`, `aiBoolean`, `aiNumber`, `aiString`, and `aiAssert`, you can set the `prompt` and `images` fields directly.
+For `aiAct` (and its `ai` shorthand), and for insight steps like `aiAsk`, `aiQuery`, `aiBoolean`, `aiNumber`, `aiString`, and `aiAssert`, you can set the `prompt` and `images` fields directly under the action key.
 
 ```yaml
 tasks:

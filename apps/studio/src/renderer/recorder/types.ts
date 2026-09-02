@@ -8,7 +8,13 @@ import type {
   StudioRecorderCodeType,
 } from '@shared/electron-contract';
 
-export type StudioRecorderPanelMode = 'playground' | 'recorder';
+export enum StudioModeTab {
+  Record = 'record',
+  Replay = 'replay',
+  Playground = 'playground',
+}
+
+export type StudioMode = StudioModeTab;
 
 export type StudioRecordingStatus = 'idle' | 'recording' | 'completed';
 export type StudioRecorderGenerationStepId = 'prepare' | 'metadata' | 'code';
@@ -83,6 +89,7 @@ export interface StudioRecorderContextValue {
   startRecording: () => Promise<StudioRecordingSession | null>;
   stopRecording: () => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
+  renameSession: (sessionId: string, name: string) => Promise<void>;
   selectSession: (sessionId: string) => void;
   generateSessionYaml: (
     sessionId: string,
@@ -103,11 +110,17 @@ export interface StudioRecorderContextValue {
       onProgress?: (progress: StudioRecorderGenerationProgress) => void;
     },
   ) => Promise<string>;
+  deleteSessionCode: (
+    sessionId: string,
+    type: StudioRecorderCodeType,
+  ) => Promise<void>;
   exportSessionJson: (sessionId: string) => Promise<void>;
   exportSessionYaml: (sessionId: string) => Promise<void>;
   exportSessionCode: (
     sessionId: string,
     type: StudioRecorderCodeType,
   ) => Promise<void>;
+  getRecorderScreenshotAssetUrl: (assetId: string) => string | null;
+  loadSessionScreenshots: (sessionId: string) => Promise<StudioRecordedEvent[]>;
   exportAllZip: () => Promise<void>;
 }

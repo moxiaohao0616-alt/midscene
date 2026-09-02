@@ -1,10 +1,12 @@
 import type { ConnectivityTestResult, DeviceAction } from '@midscene/core';
 import { PLAYGROUND_SERVER_PORT } from '@midscene/shared/constants';
+import type { TModelConfig } from '@midscene/shared/env';
 import type { BasePlaygroundAdapter } from '../adapters/base';
 import { LocalExecutionAdapter } from '../adapters/local-execution';
 import { RemoteExecutionAdapter } from '../adapters/remote-execution';
 import type {
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeResult,
   PlaygroundRecorderEvent,
   PlaygroundRecorderEventsResult,
   PlaygroundRecorderStartResult,
@@ -20,6 +22,7 @@ import type {
   FormValue,
   PlaygroundAgent,
   PlaygroundConfig,
+  PlaygroundReportRef,
   ValidationResult,
 } from '../types';
 
@@ -35,6 +38,7 @@ export interface PlaygroundInteractResult {
 export type PlaygroundPageRecordedEvent = PlaygroundRecorderEvent;
 export type {
   PlaygroundRecorderCapabilitiesResult,
+  PlaygroundRecorderDescribeResult,
   PlaygroundRecorderEventsResult,
   PlaygroundRecorderStartResult,
 };
@@ -162,8 +166,10 @@ export class PlaygroundSDK {
     return this.adapter.overrideConfig(aiConfig);
   }
 
-  async runConnectivityTest(): Promise<ConnectivityTestResult> {
-    return this.adapter.runConnectivityTest();
+  async runConnectivityTest(
+    aiConfig: TModelConfig,
+  ): Promise<ConnectivityTestResult> {
+    return this.adapter.runConnectivityTest(aiConfig);
   }
 
   // Get task progress (for remote execution)
@@ -204,6 +210,7 @@ export class PlaygroundSDK {
   async cancelExecution(requestId: string): Promise<{
     dump: any | null;
     reportHTML: string | null;
+    report: PlaygroundReportRef | null;
   } | null> {
     if (this.adapter instanceof RemoteExecutionAdapter) {
       const result = await this.adapter.cancelTask(requestId);
@@ -212,6 +219,7 @@ export class PlaygroundSDK {
         return {
           dump: (result as any).dump || null,
           reportHTML: (result as any).reportHTML || null,
+          report: (result as any).report || null,
         };
       }
     } else if (this.adapter instanceof LocalExecutionAdapter) {
@@ -221,6 +229,7 @@ export class PlaygroundSDK {
         return {
           dump: (result as any).dump || null,
           reportHTML: (result as any).reportHTML || null,
+          report: null,
         };
       }
     }
@@ -231,6 +240,7 @@ export class PlaygroundSDK {
   async getCurrentExecutionData(): Promise<{
     dump: any | null;
     reportHTML: string | null;
+    report?: PlaygroundReportRef | null;
   }> {
     if (
       this.adapter instanceof LocalExecutionAdapter &&
@@ -299,6 +309,44 @@ export class PlaygroundSDK {
       return this.adapter.getRecorderEvents(since);
     }
     return { events: [], nextIndex: since };
+  }
+
+  async describeRecorderEventAtPoint(
+    event: PlaygroundRecorderEvent,
+  ): Promise<PlaygroundRecorderDescribeResult> {
+    if (this.adapter instanceof RemoteExecutionAdapter) {
+      return this.adapter.describeRecorderEventAtPoint(event);
+    }
+    return {
+      ok: false,
+      error: 'Recorder aiDescribe requires remote execution',
+    };
+  }
+
+  async getRecorderScreenshotAsset(assetId: string): Promise<string | null> {
+    if (this.adapter instanceof RemoteExecutionAdapter) {
+      return this.adapter.getRecorderScreenshotAsset(assetId);
+    }
+    return null;
+  }
+
+  getRecorderScreenshotAssetUrl(assetId: string): string | null {
+    return this.adapter.getRecorderScreenshotAssetUrl(assetId);
+  }
+
+  async clearRecorderScreenshotAssets(sessionId: string): Promise<void> {
+    if (this.adapter instanceof RemoteExecutionAdapter) {
+      await this.adapter.clearRecorderScreenshotAssets(sessionId);
+    }
+  }
+
+  async pruneRecorderScreenshotAssets(
+    sessionId: string,
+    assetIds: string[],
+  ): Promise<void> {
+    if (this.adapter instanceof RemoteExecutionAdapter) {
+      await this.adapter.pruneRecorderScreenshotAssets(sessionId, assetIds);
+    }
   }
 
   // Get interface information (type and description)

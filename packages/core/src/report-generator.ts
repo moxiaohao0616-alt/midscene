@@ -18,20 +18,28 @@ import {
   MIDSCENE_REPORT_QUIET,
   globalConfigManager,
 } from '@midscene/shared/env';
+import { getDebug } from '@midscene/shared/logger';
 import { ifInBrowser, logMsg, uuid } from '@midscene/shared/utils';
 import {
+  DATA_SCREENSHOT_MODE_ATTR,
+  generateAgentReportComment,
   generateDumpScriptTag,
   generateImageScriptTag,
   getBaseUrlFixScript,
 } from './dump/html-utils';
-import { ScreenshotStore } from './dump/screenshot-store';
+import { compactReportDumps } from './dump/report-dump-compactor';
+import { type ImageUrlRef, ReportImageStore } from './dump/screenshot-store';
 import {
   type ExecutionDump,
   ReportActionDump,
   type ReportAttributes,
   type ReportMeta,
+  type ScreenshotMode,
 } from './types';
 import { getReportTpl } from './utils';
+
+const warnReport = getDebug('report-generator', { console: true });
+const maxReportFilenameBytes = 255;
 
 export interface IReportGenerator {
   /**
@@ -86,7 +94,7 @@ export function assertReportGenerationOptions(opts: {
 
 export class ReportGenerator implements IReportGenerator {
   private reportPath: string;
-  private screenshotMode: 'inline' | 'directory';
+  private screenshotMode: ScreenshotMode;
   private shouldPersistExecutionDump: boolean;
   private autoPrint: boolean;
   private firstWriteDone = false;
@@ -97,13 +105,17 @@ export class ReportGenerator implements IReportGenerator {
   private readonly reportStreamId: string;
 
   // Tracks screenshots already written to disk (by id) to avoid duplicates
-  private screenshotStore: ScreenshotStore;
+  private screenshotStore: ReportImageStore;
   private initialized = false;
 
   // Tracks the last execution + groupMeta for re-writing on finalize
   private lastExecution?: ExecutionDump;
   private lastReportMeta?: ReportMeta;
+  private executionsByKey = new Map<string, ExecutionDump>();
+  private executionCommentKeyByObject = new WeakMap<ExecutionDump, string>();
+  private executionCommentKeyIndex = 0;
   private reportAttributes: Record<string, string> = {};
+  private agentCommentWritten = false;
 
   // write queue for serial execution
   private writeQueue: Promise<void> = Promise.resolve();
@@ -111,7 +123,7 @@ export class ReportGenerator implements IReportGenerator {
 
   constructor(options: {
     reportPath: string;
-    screenshotMode: 'inline' | 'directory';
+    screenshotMode: ScreenshotMode;
     persistExecutionDump?: boolean;
     autoPrint?: boolean;
     reuseExistingReport?: boolean;
@@ -121,7 +133,7 @@ export class ReportGenerator implements IReportGenerator {
     this.shouldPersistExecutionDump = options.persistExecutionDump ?? false;
     this.autoPrint = options.autoPrint ?? true;
     this.reportStreamId = uuid();
-    this.screenshotStore = new ScreenshotStore({
+    this.screenshotStore = new ReportImageStore({
       mode: this.screenshotMode === 'inline' ? 'inline' : 'directory',
       reportPath: this.reportPath,
       screenshotsDir: join(dirname(this.reportPath), 'screenshots'),
@@ -132,11 +144,11 @@ export class ReportGenerator implements IReportGenerator {
         );
       },
       alsoWriteFileCopy: this.shouldPersistExecutionDump,
+      reuseExistingReport: options.reuseExistingReport,
     });
     if (options.reuseExistingReport) {
       this.hydrateStateFromExistingReport();
     }
-    this.printReportPath('will be generated at');
   }
 
   static create(
@@ -150,11 +162,11 @@ export class ReportGenerator implements IReportGenerator {
     },
   ): IReportGenerator {
     assertReportGenerationOptions(opts);
+    validateReportFileName(reportFileName, opts.outputFormat);
     if (opts.generateReport === false) return nullReportGenerator;
 
     // In browser environment, file system is not available
     if (ifInBrowser) return nullReportGenerator;
-    validateReportFileName(reportFileName);
 
     const reportRootDir = getMidsceneRunSubDir('report');
     const outputDir = join(reportRootDir, reportFileName);
@@ -181,6 +193,7 @@ export class ReportGenerator implements IReportGenerator {
   ): void {
     this.lastExecution = execution;
     this.lastReportMeta = reportMeta;
+    this.executionsByKey.set(this.getExecutionCommentKey(execution), execution);
     this.mergeReportAttributes(attributes);
     this.writeQueue = this.writeQueue.then(async () => {
       if (this.destroyed) return;
@@ -205,7 +218,14 @@ export class ReportGenerator implements IReportGenerator {
       return undefined;
     }
 
-    this.printReportPath('finalized');
+    await this.appendAgentReportComment();
+    try {
+      await compactReportDumps(this.reportPath);
+    } catch (error) {
+      warnReport(
+        `Failed to compact report ${this.reportPath}; keeping the uncompressed report: ${String(error)}`,
+      );
+    }
     return this.reportPath;
   }
 
@@ -213,17 +233,17 @@ export class ReportGenerator implements IReportGenerator {
     return this.reportPath;
   }
 
-  private printReportPath(verb: string): void {
+  private printReportPath(): void {
     if (!this.autoPrint || !this.reportPath) return;
     if (globalConfigManager.getEnvConfigInBoolean(MIDSCENE_REPORT_QUIET))
       return;
 
     if (this.screenshotMode === 'directory') {
       logMsg(
-        `Midscene - report ${verb}: npx serve ${dirname(this.reportPath)}`,
+        `Midscene - report file updated: npx serve ${dirname(this.reportPath)}`,
       );
     } else {
-      logMsg(`Midscene - report ${verb}: ${this.reportPath}`);
+      logMsg(`Midscene - report file updated: ${this.reportPath}`);
     }
   }
 
@@ -233,19 +253,19 @@ export class ReportGenerator implements IReportGenerator {
   ): Promise<void> {
     const singleDump = this.wrapAsReportDump(execution, reportMeta);
 
-    if (this.screenshotMode === 'inline') {
-      await this.writeInlineExecution(execution, singleDump);
-    } else {
-      await this.writeDirectoryExecution(execution, singleDump);
-    }
+    const referenceImageRefs = await this.writeExecution(execution, singleDump);
 
     if (this.shouldPersistExecutionDump) {
-      await this.persistExecutionDumpToFile(execution, singleDump);
+      await this.persistExecutionDumpToFile(
+        execution,
+        singleDump,
+        referenceImageRefs,
+      );
     }
 
     if (!this.firstWriteDone) {
       this.firstWriteDone = true;
-      this.printReportPath('generated');
+      this.printReportPath();
     }
   }
 
@@ -289,6 +309,9 @@ export class ReportGenerator implements IReportGenerator {
   private getDumpScriptAttributes(): Record<string, string> {
     return {
       'data-group-id': this.reportStreamId,
+      // Self-describe how this report file stores screenshots so consumers
+      // (merge/delete) never have to guess the mode from the filesystem.
+      [DATA_SCREENSHOT_MODE_ATTR]: this.screenshotMode,
       ...this.reportAttributes,
     };
   }
@@ -311,7 +334,7 @@ export class ReportGenerator implements IReportGenerator {
   }
 
   /**
-   * Append-only inline mode: write new screenshots and a dump tag on every call.
+   * Append assets and a dump tag without duplicating mode-specific workflows.
    * The frontend deduplicates executions with the same id/name (keeps last).
    * Duplicate dump JSON is acceptable; only screenshots are deduplicated.
    *
@@ -320,10 +343,10 @@ export class ReportGenerator implements IReportGenerator {
    * appended multi-MB dumps (screenshots + serialized tasks) per progress
    * tick on the main thread, starving IPC and UI for >10s per stall.
    */
-  private async writeInlineExecution(
+  private async writeExecution(
     execution: ExecutionDump,
     singleDump: ReportActionDump,
-  ): Promise<void> {
+  ): Promise<Map<string, ImageUrlRef>> {
     const dir = dirname(this.reportPath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -331,7 +354,9 @@ export class ReportGenerator implements IReportGenerator {
 
     // Initialize: write HTML template once
     if (!this.initialized) {
-      await writeFileAsync(this.reportPath, getReportTpl());
+      const baseUrlFix =
+        this.screenshotMode === 'directory' ? getBaseUrlFixScript() : '';
+      await writeFileAsync(this.reportPath, `${getReportTpl()}${baseUrlFix}`);
       this.initialized = true;
     }
 
@@ -339,43 +364,51 @@ export class ReportGenerator implements IReportGenerator {
     for (const screenshot of execution.collectScreenshots()) {
       await this.screenshotStore.persist(screenshot);
     }
+    const referenceImageRefs = await this.persistReferenceImages(execution);
 
     // Append dump tag (always — frontend keeps only last per execution id)
-    const serialized = singleDump.serialize();
+    const serialized =
+      singleDump.serializeWithReferenceImages(referenceImageRefs);
     await appendFileAsync(
       this.reportPath,
       `\n${generateDumpScriptTag(serialized, this.getDumpScriptAttributes())}`,
     );
+    return referenceImageRefs;
   }
 
-  private async writeDirectoryExecution(
+  private async persistReferenceImages(
     execution: ExecutionDump,
-    singleDump: ReportActionDump,
-  ): Promise<void> {
-    const dir = dirname(this.reportPath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+  ): Promise<Map<string, ImageUrlRef>> {
+    const refs = new Map<string, ImageUrlRef>();
+    for (const imageUrl of execution.getReferenceImageUrls()) {
+      const ref = await this.screenshotStore.persistReferenceImage(imageUrl);
+      refs.set(imageUrl, ref);
+    }
+    return refs;
+  }
+
+  private async appendAgentReportComment(): Promise<void> {
+    if (
+      this.agentCommentWritten ||
+      !this.lastReportMeta ||
+      this.executionsByKey.size === 0
+    ) {
+      return;
     }
 
-    for (const screenshot of execution.collectScreenshots()) {
-      await this.screenshotStore.persist(screenshot);
-    }
-
-    // 2. Append dump tag (always — frontend keeps only last per execution id)
-    const serialized = singleDump.serialize();
-
-    if (!this.initialized) {
-      await writeFileAsync(
-        this.reportPath,
-        `${getReportTpl()}${getBaseUrlFixScript()}`,
-      );
-      this.initialized = true;
-    }
-
+    const reportDump = new ReportActionDump({
+      sdkVersion: this.lastReportMeta.sdkVersion,
+      groupName: this.lastReportMeta.groupName,
+      groupDescription: this.lastReportMeta.groupDescription,
+      modelBriefs: this.lastReportMeta.modelBriefs,
+      deviceType: this.lastReportMeta.deviceType,
+      executions: Array.from(this.executionsByKey.values()),
+    });
     await appendFileAsync(
       this.reportPath,
-      `\n${generateDumpScriptTag(serialized, this.getDumpScriptAttributes())}`,
+      `\n${generateAgentReportComment(reportDump)}`,
     );
+    this.agentCommentWritten = true;
   }
 
   private getExecutionLogKey(execution: ExecutionDump): string {
@@ -387,9 +420,25 @@ export class ReportGenerator implements IReportGenerator {
     return `id:${execution.id}`;
   }
 
+  private getExecutionCommentKey(execution: ExecutionDump): string {
+    if (execution.id) {
+      return `id:${execution.id}`;
+    }
+
+    const existingKey = this.executionCommentKeyByObject.get(execution);
+    if (existingKey) {
+      return existingKey;
+    }
+
+    const key = `no-id:${this.executionCommentKeyIndex++}`;
+    this.executionCommentKeyByObject.set(execution, key);
+    return key;
+  }
+
   private async persistExecutionDumpToFile(
     execution: ExecutionDump,
     singleDump: ReportActionDump,
+    referenceImageRefs: ReadonlyMap<string, ImageUrlRef>,
   ): Promise<void> {
     const dir = dirname(this.reportPath);
     if (!existsSync(dir)) {
@@ -407,7 +456,11 @@ export class ReportGenerator implements IReportGenerator {
 
     const fileName = `${fileIndex}.execution.json`;
     const filePath = join(dirname(this.reportPath), fileName);
-    await writeFileAsync(filePath, singleDump.serialize(2), 'utf-8');
+    await writeFileAsync(
+      filePath,
+      singleDump.serializeWithReferenceImages(referenceImageRefs, 2),
+      'utf-8',
+    );
   }
 }
 
@@ -417,7 +470,10 @@ function ensureHtmlFileName(reportFileName: string): string {
     : `${reportFileName}.html`;
 }
 
-function validateReportFileName(reportFileName: string): void {
+function validateReportFileName(
+  reportFileName: string,
+  outputFormat?: 'single-html' | 'html-and-external-assets',
+): void {
   if (!reportFileName?.trim()) {
     throw new Error('reportFileName must be a non-empty string');
   }
@@ -431,6 +487,17 @@ function validateReportFileName(reportFileName: string): void {
   if (/[:*?"<>|]/.test(reportFileName)) {
     throw new Error(
       'reportFileName contains illegal filename characters: : * ? " < > |',
+    );
+  }
+
+  const filenameComponent =
+    outputFormat === 'html-and-external-assets'
+      ? reportFileName
+      : ensureHtmlFileName(reportFileName);
+  const filenameBytes = new TextEncoder().encode(filenameComponent).byteLength;
+  if (filenameBytes > maxReportFilenameBytes) {
+    throw new Error(
+      `reportFileName produces a filename component of ${filenameBytes} UTF-8 bytes; maximum is ${maxReportFilenameBytes}`,
     );
   }
 }

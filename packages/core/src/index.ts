@@ -4,7 +4,7 @@ import { TaskRunner } from './task-runner';
 import { getVersion } from './utils';
 
 export {
-  plan,
+  standardPlan,
   AiLocateElement,
   runConnectivityTest,
   getMidsceneLocationSchema,
@@ -15,7 +15,6 @@ export {
   TUserPromptSchema,
   type TMultimodalPrompt,
   type TUserPrompt,
-  type ConnectivityCheckResultItem,
   type ConnectivityTestConfig,
   type ConnectivityTestResult,
 } from './ai-model/index';
@@ -57,11 +56,34 @@ export type {
   DetailedLocateParam,
 } from './yaml';
 
-export { Agent, type AgentOpt, type AiActOptions, createAgent } from './agent';
+export {
+  Agent,
+  type AgentOpt,
+  type AiActOptions,
+  type GherkinStepKeyword,
+  type MidsceneUsageMetrics,
+  type RunGherkinScenarioOptions,
+  type UsageBucket,
+  createAgent,
+  type UIObservation,
+  type UIObserver,
+  type UIObserverOption,
+} from './agent';
+export {
+  describeElementAtPoint,
+  verifyElementDescriptionAtPoint,
+  verifyLocator,
+  type DescribeElementAtPointOptions,
+  type DescribeElementCoordinateSpace,
+  type ElementDescriberRuntime,
+  type VerifyElementDescriptionAtPointOptions,
+} from './element-describer';
 
 // Dump utilities
 export {
+  createInlineImageResolver,
   restoreImageReferences,
+  restoreReportImageReferences,
   escapeContent,
   unescapeContent,
   parseImageScripts,
@@ -69,7 +91,19 @@ export {
   parseDumpScriptAttributes,
   generateImageScriptTag,
   generateDumpScriptTag,
+  deriveTaskStatus,
+  deriveCaseStatus,
 } from './dump';
+export type {
+  TaskStatusFields,
+  DerivedTaskStatus,
+  RestoredScreenshotReference,
+  StoredImageReferenceResolver,
+} from './dump';
+export {
+  getTaskSearchArea,
+  getTaskServiceDump,
+} from './dump/task-service-dump';
 
 // Report generator
 export type { IReportGenerator } from './report-generator';
@@ -96,13 +130,22 @@ export {
 
 // ScreenshotItem
 export { ScreenshotItem } from './screenshot-item';
-export { ScreenshotStore, type ScreenshotRef } from './dump/screenshot-store';
+export type {
+  ImageUrlRef,
+  ScreenshotRef,
+  StoredImageRef,
+} from './dump/image-reference';
+export {
+  ReportImageStore,
+  ScreenshotStore,
+} from './dump/screenshot-store';
 
 export {
   executionToMarkdown,
   reportToMarkdown,
   type ExecutionMarkdownOptions,
   type ExecutionMarkdownResult,
+  type ReportMarkdownOptions,
   type ReportMarkdownResult,
   type MarkdownAttachment,
 } from './report-markdown';

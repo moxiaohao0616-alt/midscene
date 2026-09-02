@@ -1,12 +1,15 @@
 import type { ExecutionTask } from '@midscene/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 import { buildTimelineScreenshots } from './build-timeline-screenshots';
+
+const onePixelPngBase64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8yrwAAAABJRU5ErkJggg==';
 
 interface TaskFixtureOptions {
   id: string;
   startTs?: number;
-  uiContextScreenshot?: { base64: string };
-  recorder?: { ts: number; base64?: string }[];
+  uiContextScreenshot?: { base64: string } | string;
+  recorder?: { ts: number; base64?: string; screenshot?: string }[];
 }
 
 const makeTask = (opts: TaskFixtureOptions): ExecutionTask =>
@@ -16,11 +19,15 @@ const makeTask = (opts: TaskFixtureOptions): ExecutionTask =>
     uiContext: opts.uiContextScreenshot
       ? { screenshot: opts.uiContextScreenshot }
       : undefined,
-    recorder: opts.recorder?.map((r) => ({
-      type: 'screenshot',
-      ts: r.ts,
-      screenshot: r.base64 !== undefined ? { base64: r.base64 } : undefined,
-    })),
+    recorder: [
+      ...(opts.recorder?.map((r) => ({
+        type: 'screenshot',
+        ts: r.ts,
+        screenshot:
+          r.screenshot ??
+          (r.base64 !== undefined ? { base64: r.base64 } : undefined),
+      })) ?? []),
+    ],
   }) as unknown as ExecutionTask;
 
 describe('buildTimelineScreenshots', () => {
@@ -79,6 +86,34 @@ describe('buildTimelineScreenshots', () => {
     expect(startingTime).toBe(1800);
     expect(allScreenshots.map((s) => s.timeOffset)).toEqual([0, 700, 1200]);
     expect(allScreenshots.map((s) => s.img)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('accepts recorder screenshots stored as raw base64 strings', () => {
+    const task = makeTask({
+      id: 'raw-recorder',
+      startTs: 1000,
+      recorder: [{ ts: 1200, screenshot: onePixelPngBase64 }],
+    });
+
+    const { allScreenshots } = buildTimelineScreenshots([task]);
+
+    expect(allScreenshots).toHaveLength(1);
+    expect(allScreenshots[0].img).toBe(
+      `data:image/png;base64,${onePixelPngBase64}`,
+    );
+  });
+
+  it('keeps already-prefixed data URLs unchanged', () => {
+    const dataUrl = `data:image/png;base64,${onePixelPngBase64}`;
+    const task = makeTask({
+      id: 'data-url-recorder',
+      startTs: 1000,
+      recorder: [{ ts: 1200, screenshot: dataUrl }],
+    });
+
+    const { allScreenshots } = buildTimelineScreenshots([task]);
+
+    expect(allScreenshots[0].img).toBe(dataUrl);
   });
 
   it('orders screenshots from multiple tasks by absolute time', () => {
@@ -190,8 +225,8 @@ describe('buildTimelineScreenshots', () => {
   });
 
   it('still uses dropped recorder ts to compute starting time', () => {
-    // legacy behaviour: a recorder with no screenshot still contributes its ts
-    // to startingTime so that surviving entries render at the right offset.
+    // A recorder with no screenshot still contributes its ts to startingTime so
+    // surviving entries render at the right offset.
     const taskA = makeTask({
       id: 'A',
       startTs: 5000,

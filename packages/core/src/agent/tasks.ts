@@ -1,21 +1,31 @@
 import { AIResponseParseError, ConversationHistory } from '@/ai-model';
 import type { ModelRuntime } from '@/ai-model/models';
-import { buildTypeQueryDemandValue } from '@/ai-model/prompt/extraction';
-import { genericXmlPlan } from '@/ai-model/workflows/planning';
+import { buildTypeQueryDemandValue } from '@/ai-model/prompt/insight';
+import { prepareUserPrompt } from '@/ai-model/shared/multimodal-prompt';
+import { standardPlan } from '@/ai-model/workflows/planning';
 import {
   type TMultimodalPrompt,
   type TUserPrompt,
   getReadableTimeString,
-  multimodalPromptToChatMessages,
   userPromptToMultimodalPrompt,
   userPromptToString,
 } from '@/common';
-import type { AbstractInterface, FileChooserHandler } from '@/device';
+import type { AbstractInterface } from '@/device';
 import type Service from '@/service';
-import type { TaskRunner } from '@/task-runner';
+import type {
+  ExecutionReferenceImage,
+  TaskRunner,
+  TaskRunnerEvent,
+} from '@/task-runner';
 import { TaskExecutionError } from '@/task-runner';
 import type {
+  AiActEffort,
+  AiActProgressData,
+  AiActProgressPhase,
+  DetailedLocateParam,
   DeviceAction,
+  ExecutionRecorderItem,
+  ExecutionTask,
   ExecutionTaskApply,
   ExecutionTaskInsightQueryApply,
   ExecutionTaskPlanningApply,
@@ -24,15 +34,21 @@ import type {
   PlanningAIResponse,
   PlanningAction,
   PlanningActionParamWaitFor,
-  PlanningLocateParam,
   ServiceDump,
   ServiceExtractOption,
   ServiceExtractParam,
+  UIContext,
 } from '@/types';
-import { ServiceError } from '@/types';
+import { ServiceError, aiActProgressScope } from '@/types';
 import { getDebug } from '@midscene/shared/logger';
 import { assert } from '@midscene/shared/utils';
 import { ExecutionSession } from './execution-session';
+import { withFileChooser } from './file-chooser';
+import {
+  type AgentProgressPublisher,
+  createAiActActionReporter,
+  errorMessageForAiAct,
+} from './progress';
 import { TaskBuilder } from './task-builder';
 import type { TaskCache } from './task-cache';
 export { locatePlanForLocate } from './task-builder';
@@ -49,10 +65,13 @@ interface ExecutionResult<OutputType = any> {
 }
 
 interface TaskExecutorHooks {
-  onTaskUpdate?: (
+  onSnapshotChange?: (
     runner: TaskRunner,
     error?: TaskExecutionError,
   ) => Promise<void> | void;
+  // Publish onto the agent's progress bus. The bus owns sequencing, so the
+  // executor is a pure producer: it names the scope/phase and hands over data.
+  onProgress?: AgentProgressPublisher;
 }
 
 export type ActionReportOptions = {
@@ -64,7 +83,23 @@ const debug = getDebug('device-task-executor');
 const warnLog = getDebug('device-task-executor', { console: true });
 const maxErrorCountAllowedInOnePlanningLoop = 5;
 
+// Cap each task's planning feedback so a large action output (e.g. a long adb
+// shell stdout) cannot blow up the next planning request's context. This is the
+// single place that truncates feedback before it is sent to the model; action
+// implementations should hand over the untruncated value.
+const maxPlanningFeedbackLength = 500;
+
+function truncatePlanningFeedback(feedback: string): string {
+  if (feedback.length <= maxPlanningFeedbackLength) {
+    return feedback;
+  }
+
+  return `${feedback.slice(0, maxPlanningFeedbackLength)}
+...[truncated, ${feedback.length - maxPlanningFeedbackLength} more characters]`;
+}
+
 export { TaskExecutionError };
+export { withFileChooser } from './file-chooser';
 
 export class TaskExecutor {
   interface: AbstractInterface;
@@ -125,21 +160,94 @@ export class TaskExecutor {
 
   private createExecutionSession(
     title: string,
-    options?: { tasks?: ExecutionTaskApply[] },
+    options?: {
+      tasks?: ExecutionTaskApply[];
+      uiContext?: UIContext;
+      referenceImages?: readonly ExecutionReferenceImage[];
+      onSnapshotChange?: (
+        runner: TaskRunner,
+        error?: TaskExecutionError,
+      ) => Promise<void> | void;
+      onTaskEvent?: (event: TaskRunnerEvent) => Promise<void> | void;
+    },
   ) {
     return new ExecutionSession(
       title,
-      () => Promise.resolve(this.service.contextRetrieverFn()),
+      () =>
+        options?.uiContext
+          ? Promise.resolve(options.uiContext)
+          : Promise.resolve(this.service.contextRetrieverFn()),
       {
         onTaskStart: this.onTaskStartCallback,
         tasks: options?.tasks,
-        onTaskUpdate: this.hooks?.onTaskUpdate,
+        referenceImages: options?.referenceImages,
+        onSnapshotChange: async (runner, error) => {
+          await this.hooks?.onSnapshotChange?.(runner, error);
+          await options?.onSnapshotChange?.(runner, error);
+        },
+        ...(options?.onTaskEvent ? { onTaskEvent: options.onTaskEvent } : {}),
       },
     );
   }
 
   private getActionSpace(): DeviceAction[] {
     return this.providedActionSpace;
+  }
+
+  /**
+   * Publish one event onto the agent's progress bus. The task layer is a pure
+   * producer here: it names the scope/phase and forwards the structured
+   * payload; the bus stamps the sequence and isolates listener errors. It has
+   * no knowledge of how the event is rendered or consumed.
+   */
+  private async emitProgress(
+    scope: string,
+    phase: string,
+    data: unknown,
+  ): Promise<void> {
+    await this.hooks?.onProgress?.(scope, phase, data);
+  }
+
+  /**
+   * aiAct-flavored convenience over {@link emitProgress}: aiAct is the first
+   * producer ("pilot") on the generic bus, so its events are simply tagged with
+   * the `aiAct` scope.
+   */
+  private emitAiActProgress(
+    phase: AiActProgressPhase,
+    data: AiActProgressData,
+  ): Promise<void> {
+    return this.emitProgress(aiActProgressScope, phase, data);
+  }
+
+  /**
+   * Set the pending feedback message consumed by the next planning round.
+   * The message is always prefixed with the current time. When a body is
+   * provided it is appended after the timestamp; otherwise only the time
+   * context is recorded. This is the single entry point for writing
+   * `pendingFeedbackMessage` so the time prefix stays consistent.
+   */
+  private setPendingFeedbackMessage(
+    conversationHistory: ConversationHistory,
+    timeString: string,
+    body?: string,
+  ) {
+    conversationHistory.pendingFeedbackMessage = body
+      ? `Time: ${timeString}, ${body}`
+      : `Current time: ${timeString}`;
+  }
+
+  /**
+   * Collect feedback produced by executed tasks for the next planning round.
+   * Returns undefined when no task reported feedback.
+   */
+  private collectPlanningFeedback(tasks: ExecutionTask[]): string | undefined {
+    const feedbackMessages = tasks.flatMap(({ planningFeedback }) =>
+      planningFeedback ? [truncatePlanningFeedback(planningFeedback)] : [],
+    );
+    return feedbackMessages.length > 0
+      ? feedbackMessages.join('\n\n')
+      : undefined;
   }
 
   /**
@@ -192,6 +300,9 @@ export class TaskExecutor {
         reportOptions?.type || 'Act',
         reportOptions?.prompt || userPromptToString(userInstruction),
       ),
+      {
+        referenceImages: userPromptToMultimodalPrompt(userInstruction)?.images,
+      },
     );
 
     const task: ExecutionTaskPlanningApply = {
@@ -203,7 +314,7 @@ export class TaskExecutor {
           ? { userInstructionDisplay: reportOptions.prompt }
           : {}),
       },
-      executor: async (param, executorContext) => {
+      executor: async (executorContext) => {
         const { uiContext } = executorContext;
         assert(uiContext, 'uiContext is required for Planning task');
         return {
@@ -238,14 +349,17 @@ export class TaskExecutor {
     plans: PlanningAction[],
     planningModel: ModelRuntime,
     defaultModel: ModelRuntime,
+    options?: { uiContext?: UIContext },
   ): Promise<ExecutionResult> {
-    const session = this.createExecutionSession(title);
+    const session = this.createExecutionSession(title, options);
+    const runner = session.getRunner();
+    const executionPlanningModel = { ...planningModel, executionId: runner.id };
+    const executionDefaultModel = { ...defaultModel, executionId: runner.id };
     const { tasks } = await this.convertPlanToExecutable(
       plans,
-      planningModel,
-      defaultModel,
+      executionPlanningModel,
+      executionDefaultModel,
     );
-    const runner = session.getRunner();
     const result = await session.appendAndRun(tasks);
     const { output } = result ?? {};
     return {
@@ -258,12 +372,10 @@ export class TaskExecutor {
     userPrompt: TUserPrompt,
     planningModel: ModelRuntime,
     defaultModel: ModelRuntime,
-    includeLocateInPlanning: boolean,
     aiActContext?: string,
     cacheable?: boolean,
     replanningCycleLimitOverride?: number,
-    imagesIncludeCount?: number,
-    deepThink?: boolean,
+    effort: AiActEffort = 'balance',
     fileChooserAccept?: string[],
     deepLocate?: boolean,
     abortSignal?: AbortSignal,
@@ -282,12 +394,10 @@ export class TaskExecutor {
         userPrompt,
         planningModel,
         defaultModel,
-        includeLocateInPlanning,
         aiActContext,
         cacheable,
         replanningCycleLimitOverride,
-        imagesIncludeCount,
-        deepThink,
+        effort,
         deepLocate,
         abortSignal,
         reportOptions,
@@ -321,7 +431,7 @@ export class TaskExecutor {
         task.subType === 'Locate' &&
         task.hitBy?.from === 'Cache'
       ) {
-        const prompt = (task.param as PlanningLocateParam | undefined)?.prompt;
+        const prompt = (task.param as DetailedLocateParam | undefined)?.prompt;
         if (prompt) {
           this.taskCache.markLocateCacheStale(prompt);
         }
@@ -333,12 +443,10 @@ export class TaskExecutor {
     userPrompt: TUserPrompt,
     planningModel: ModelRuntime,
     defaultModel: ModelRuntime,
-    includeLocateInPlanning: boolean,
     aiActContext?: string,
     cacheable?: boolean,
     replanningCycleLimitOverride?: number,
-    imagesIncludeCount?: number,
-    deepThink?: boolean,
+    effort: AiActEffort = 'balance',
     deepLocate?: boolean,
     abortSignal?: AbortSignal,
     reportOptions?: ActionReportOptions,
@@ -351,53 +459,100 @@ export class TaskExecutor {
       | undefined
     >
   > {
-    if (
-      deepLocate &&
-      !planningModel.adapter.planning.supportsActionDeepLocate
-    ) {
-      warnLog(
-        `The "deepLocate" option is not supported for aiAct with the current planning adapter (modelFamily: ${planningModel.config.modelFamily ?? 'unknown'}). It will be ignored.`,
-      );
-      deepLocate = false;
-    }
-
     const conversationHistory = new ConversationHistory();
+    const promptDisplay =
+      reportOptions?.prompt || userPromptToString(userPrompt);
+
+    // Per-call reporter that maps the runner's native task events to aiAct
+    // action progress for the action batch currently running. Kept local (not
+    // on the instance) so concurrent aiAct() calls on the same executor stay
+    // isolated; it is set while a planned batch runs and cleared afterwards.
+    let activeActionReporter:
+      | ((event: TaskRunnerEvent) => Promise<void>)
+      | undefined;
 
     const session = this.createExecutionSession(
-      taskTitleStr(
-        reportOptions?.type || 'Act',
-        reportOptions?.prompt || userPromptToString(userPrompt),
-      ),
+      taskTitleStr(reportOptions?.type || 'Act', promptDisplay),
+      {
+        referenceImages: userPromptToMultimodalPrompt(userPrompt)?.images,
+        onTaskEvent: async (event) => {
+          await activeActionReporter?.(event);
+        },
+      },
     );
     const runner = session.getRunner();
+    planningModel = { ...planningModel, executionId: runner.id };
+    defaultModel = { ...defaultModel, executionId: runner.id };
+
+    const noIndividualLocateModel = planningModel.config.slot === 'default';
+    const includeLocateInPlanning =
+      effort !== 'deepThink' && noIndividualLocateModel;
+    const imagesIncludeCount = effort === 'deepThink' ? 2 : 1;
+
+    debug('setting includeLocateInPlanning to', includeLocateInPlanning, {
+      effort,
+      noIndividualLocateModel,
+    });
 
     let replanCount = 0;
     const yamlFlow: MidsceneYamlFlowItem[] = [];
     const replanningCycleLimit =
       replanningCycleLimitOverride ?? this.replanningCycleLimit;
-    assert(
-      replanningCycleLimit !== undefined,
-      'replanningCycleLimit is required for TaskExecutor.action',
-    );
+    if (replanningCycleLimit === undefined) {
+      throw new Error(
+        'replanningCycleLimit is required for TaskExecutor.action',
+      );
+    }
+
+    await this.emitAiActProgress('start', {
+      prompt: promptDisplay,
+      planLimit: replanningCycleLimit,
+    });
+
+    const appendFailedPlan = async (
+      errorMsg: string,
+      planIndex?: number,
+    ): Promise<{
+      output: undefined;
+      runner: TaskRunner;
+    }> => {
+      await this.emitAiActProgress('failed', {
+        ...(planIndex ? { planIndex } : {}),
+        planLimit: replanningCycleLimit,
+        error: errorMsg,
+      });
+      return session.appendErrorPlan(errorMsg);
+    };
 
     let errorCountInOnePlanningLoop = 0; // count the number of errors in one planning loop
     let outputString: string | undefined;
+    let latestPlanResult: PlanningAIResponse | undefined;
+    let latestPlanIndex = 0;
 
     if (abortSignal?.aborted) {
-      return session.appendErrorPlan(
+      return appendFailedPlan(
         `Task aborted: ${abortSignal.reason || 'abort signal received'}`,
       );
     }
-    const referenceImageMessages = await multimodalPromptToChatMessages(
-      userPromptToMultimodalPrompt(userPrompt),
-    );
+    const getPreparedUserPrompt = (() => {
+      let promise: ReturnType<typeof prepareUserPrompt> | undefined;
+
+      return () => {
+        promise ??= prepareUserPrompt(userPrompt);
+        return promise;
+      };
+    })();
 
     // Main planning loop - unified plan/replan logic
     while (true) {
+      const planIndex = replanCount + 1;
+      latestPlanIndex = planIndex;
+
       // Check abort signal before each planning cycle
       if (abortSignal?.aborted) {
-        return session.appendErrorPlan(
+        return appendFailedPlan(
           `Task aborted: ${abortSignal.reason || 'abort signal received'}`,
+          planIndex,
         );
       }
 
@@ -416,16 +571,23 @@ export class TaskExecutor {
             ...(reportOptions?.prompt
               ? { userInstructionDisplay: reportOptions.prompt }
               : {}),
+            replanningCycleLimit,
             aiActContext,
             imagesIncludeCount,
-            deepThink,
+            effort,
             ...(subGoalStatus ? { subGoalStatus } : {}),
             ...(memoriesStatus ? { memoriesStatus } : {}),
           },
-          executor: async (param, executorContext) => {
+          executor: async (executorContext) => {
             const { uiContext } = executorContext;
             assert(uiContext, 'uiContext is required for Planning task');
+            const planningUiContext = uiContext as UIContext;
             const timing = executorContext.task.timing;
+            await this.emitAiActProgress('plan_thinking', {
+              planIndex,
+              planLimit: replanningCycleLimit,
+              screenshot: planningUiContext.screenshot,
+            });
 
             const actionSpace = this.getActionSpace();
             debug(
@@ -442,21 +604,22 @@ export class TaskExecutor {
             const planImpl =
               planningModel.adapter.planning.kind === 'custom'
                 ? planningModel.adapter.planning.planFn
-                : genericXmlPlan;
+                : standardPlan;
 
             let planResult: Awaited<ReturnType<typeof planImpl>>;
             try {
+              const preparedUserPrompt = await getPreparedUserPrompt();
+
               setTimingFieldOnce(timing, 'callAiStart');
-              planResult = await planImpl(param.userInstruction, {
-                context: uiContext,
-                actionContext: param.aiActContext,
+              planResult = await planImpl(preparedUserPrompt, {
+                context: planningUiContext,
+                actionContext: aiActContext,
                 actionSpace,
                 modelRuntime: planningModel,
                 conversationHistory,
                 includeLocateInPlanning,
                 imagesIncludeCount,
-                deepThink,
-                referenceImageMessages,
+                effort,
                 abortSignal,
               });
             } catch (planError) {
@@ -469,8 +632,14 @@ export class TaskExecutor {
                 executorContext.task.log = {
                   ...(executorContext.task.log || {}),
                   rawResponse: planError.rawResponse,
+                  rawChoiceMessage: planError.rawChoiceMessage,
                 };
               }
+              await this.emitAiActProgress('plan_failed', {
+                planIndex,
+                planLimit: replanningCycleLimit,
+                error: errorMessageForAiAct(planError),
+              });
               throw planError;
             } finally {
               setTimingFieldOnce(timing, 'callAiEnd');
@@ -485,6 +654,7 @@ export class TaskExecutor {
               error,
               usage,
               rawResponse,
+              rawChoiceMessage,
               reasoning_content,
               finalizeSuccess,
               finalizeMessage,
@@ -496,6 +666,7 @@ export class TaskExecutor {
             executorContext.task.log = {
               ...(executorContext.task.log || {}),
               rawResponse,
+              rawChoiceMessage,
             };
             executorContext.task.usage = withUsageIntent(usage, 'planning');
             executorContext.task.reasoning_content = reasoning_content;
@@ -510,16 +681,40 @@ export class TaskExecutor {
               updateSubGoals,
               markFinishedIndexes,
             };
-            executorContext.uiContext = uiContext;
+            executorContext.uiContext = planningUiContext;
+
+            // Forward the raw in-progress reasoning the model produced; the
+            // consumer decides which field to surface and how to format it.
+            // `finalizeMessage` is intentionally left for the `complete` event.
+            if (log || thought) {
+              await this.emitAiActProgress('plan_planned', {
+                planIndex,
+                planLimit: replanningCycleLimit,
+                ...(log ? { log } : {}),
+                ...(thought ? { thought } : {}),
+              });
+            }
+
+            if (error) {
+              const errorMessage = `Failed to continue: ${error}\n${log || ''}`;
+              await this.emitAiActProgress('plan_failed', {
+                planIndex,
+                planLimit: replanningCycleLimit,
+                error: errorMessage,
+              });
+            }
 
             assert(!error, `Failed to continue: ${error}\n${log || ''}`);
 
             // Check if task was finalized with failure
             if (finalizeSuccess === false) {
-              assert(
-                false,
-                `Task failed: ${finalizeMessage || 'No error message provided'}\n${log || ''}`,
-              );
+              const errorMessage = `Task failed: ${finalizeMessage || 'No error message provided'}\n${log || ''}`;
+              await this.emitAiActProgress('plan_failed', {
+                planIndex,
+                planLimit: replanningCycleLimit,
+                error: errorMessage,
+              });
+              assert(false, errorMessage);
             }
 
             return {
@@ -535,6 +730,7 @@ export class TaskExecutor {
       );
 
       const planResult = result?.output as PlanningAIResponse | undefined;
+      latestPlanResult = planResult;
 
       // Execute planned actions
       const plans = planResult?.actions || [];
@@ -553,10 +749,11 @@ export class TaskExecutor {
           },
         );
       } catch (error) {
-        return session.appendErrorPlan(
-          `Error converting plans to executable tasks: ${error}, plans: ${JSON.stringify(
+        return appendFailedPlan(
+          `Error converting plans to executable tasks: ${errorMessageForAiAct(error)}, plans: ${JSON.stringify(
             plans,
           )}`,
+          planIndex,
         );
       }
       if (conversationHistory.pendingFeedbackMessage) {
@@ -566,34 +763,56 @@ export class TaskExecutor {
         );
       }
 
-      // Set initial time context for the first planning call
+      // Capture the time context for the next planning call before running.
       const initialTimeString = await this.getTimeString();
-      conversationHistory.pendingFeedbackMessage += `Current time: ${initialTimeString}`;
 
       const taskCountBeforeRun = runner.tasks.length;
+      // Scope a reporter to this replanning round so native task events from the
+      // runner are mapped to aiAct progress with the right plan context; cleared
+      // in `finally` so events fired between batches are ignored.
+      activeActionReporter = createAiActActionReporter(
+        planIndex,
+        replanningCycleLimit,
+        (phase, data) => this.emitAiActProgress(phase, data),
+      );
       try {
         await session.appendAndRun(executables.tasks);
+        this.setPendingFeedbackMessage(
+          conversationHistory,
+          initialTimeString,
+          this.collectPlanningFeedback(runner.tasks.slice(taskCountBeforeRun)),
+        );
       } catch (error: any) {
         // errorFlag = true;
         errorCountInOnePlanningLoop++;
         const timeString = await this.getTimeString();
-        conversationHistory.pendingFeedbackMessage = `Time: ${timeString}, Error executing running tasks: ${error?.message || String(error)}`;
+        this.setPendingFeedbackMessage(
+          conversationHistory,
+          timeString,
+          `Error executing running tasks: ${error?.message || String(error)}`,
+        );
         debug(
           'error when executing running tasks, but continue to run if it is not too many errors:',
           error instanceof Error ? error.message : String(error),
           'current error count in one planning loop:',
           errorCountInOnePlanningLoop,
         );
+      } finally {
+        activeActionReporter = undefined;
       }
 
       if (errorCountInOnePlanningLoop > maxErrorCountAllowedInOnePlanningLoop) {
-        return session.appendErrorPlan('Too many errors in one planning loop');
+        return appendFailedPlan(
+          'Too many errors in one planning loop',
+          planIndex,
+        );
       }
 
       // Check abort signal after executing actions
       if (abortSignal?.aborted) {
-        return session.appendErrorPlan(
+        return appendFailedPlan(
           `Task aborted: ${abortSignal.reason || 'abort signal received'}`,
+          planIndex,
         );
       }
 
@@ -616,7 +835,7 @@ export class TaskExecutor {
 
       if (replanCount > replanningCycleLimit) {
         const errorMsg = `Replanned ${replanningCycleLimit} times, exceeding the limit. Please configure a larger value for replanningCycleLimit (or use MIDSCENE_REPLANNING_CYCLE_LIMIT) to handle more complex tasks.`;
-        return session.appendErrorPlan(errorMsg);
+        return appendFailedPlan(errorMsg, planIndex);
       }
 
       if (!conversationHistory.pendingFeedbackMessage) {
@@ -624,6 +843,21 @@ export class TaskExecutor {
         conversationHistory.pendingFeedbackMessage = `Time: ${timeString}, I have finished the action previously planned.`;
       }
     }
+
+    // Carry the raw final text; the consumer formats it. `outputString` is the
+    // model's finalize message, with the latest plan's log/thought as fallback
+    // context for consumers that want to show why the run completed.
+    await this.emitAiActProgress('complete', {
+      planIndex: latestPlanIndex,
+      planLimit: replanningCycleLimit,
+      ...((outputString ?? latestPlanResult?.output)
+        ? { output: outputString ?? latestPlanResult?.output }
+        : {}),
+      ...(latestPlanResult?.log ? { log: latestPlanResult.log } : {}),
+      ...(latestPlanResult?.thought
+        ? { thought: latestPlanResult.thought }
+        : {}),
+    });
 
     return {
       output: {
@@ -640,12 +874,16 @@ export class TaskExecutor {
     modelRuntime: ModelRuntime,
     opt?: ServiceExtractOption,
     multimodalPrompt?: TMultimodalPrompt,
+    executionOptions?: {
+      abortSignal?: AbortSignal;
+    },
   ) {
     const queryTask: ExecutionTaskInsightQueryApply = {
       type: 'Insight',
       subType: type,
       param: {
         domIncluded: opt?.domIncluded,
+        ...(opt?.context !== undefined ? { context: opt.context } : {}),
         dataDemand: multimodalPrompt
           ? ({
               demand,
@@ -653,7 +891,7 @@ export class TaskExecutor {
             } as never)
           : demand, // for user param presentation in report right sidebar
       },
-      executor: async (param, taskContext) => {
+      executor: async (taskContext) => {
         const { task } = taskContext;
         let queryDump: ServiceDump | undefined;
         const applyDump = (dump: ServiceDump) => {
@@ -661,6 +899,9 @@ export class TaskExecutor {
           task.log = {
             dump,
             rawResponse: dump.taskInfo?.rawResponse,
+            rawChoiceMessage: dump.taskInfo?.rawChoiceMessage,
+            searchAreaRawChoiceMessage:
+              dump.taskInfo?.searchAreaRawChoiceMessage,
           };
           task.usage = withUsageIntent(dump.taskInfo?.usage, 'insight');
           if (dump.taskInfo?.reasoning_content) {
@@ -709,12 +950,17 @@ export class TaskExecutor {
             extraPageDescription,
             multimodalPrompt,
             uiContext,
+            executionOptions,
           );
         } catch (error) {
           if (error instanceof ServiceError) {
             applyDump(error.dump);
           }
           throw error;
+        } finally {
+          // Surface the captured screenshot sequence in the report, then release
+          // it from the UIContext so its base64 is not retained twice.
+          recordAndReleaseScreenshotSequence(task, uiContext);
         }
 
         const { data, thought, dump } = extractResult;
@@ -745,9 +991,10 @@ export class TaskExecutor {
           }
         }
 
-        if (type === 'Assert' && !outputResult) {
-          task.thought = thought;
-          throw new Error(`Assertion failed: ${thought}`);
+        // Keep assertion failures in the task result so TaskRunner can persist
+        // the model dump before aiAssert turns the result into a thrown error.
+        if (type === 'Assert') {
+          outputResult = Boolean(outputResult);
         }
 
         return {
@@ -766,23 +1013,35 @@ export class TaskExecutor {
     modelRuntime: ModelRuntime,
     opt?: ServiceExtractOption,
     multimodalPrompt?: TMultimodalPrompt,
+    executionOptions?: {
+      abortSignal?: AbortSignal;
+      uiContext?: UIContext;
+    },
   ): Promise<ExecutionResult<T>> {
     const session = this.createExecutionSession(
       taskTitleStr(
         type,
         typeof demand === 'string' ? demand : JSON.stringify(demand),
       ),
-    );
-
-    const queryTask = await this.createTypeQueryTask(
-      type,
-      demand,
-      modelRuntime,
-      opt,
-      multimodalPrompt,
+      {
+        ...(executionOptions?.uiContext
+          ? { uiContext: executionOptions.uiContext }
+          : {}),
+        referenceImages: multimodalPrompt?.images,
+      },
     );
 
     const runner = session.getRunner();
+    const executionModelRuntime = { ...modelRuntime, executionId: runner.id };
+    const queryTask = await this.createTypeQueryTask(
+      type,
+      demand,
+      executionModelRuntime,
+      opt,
+      multimodalPrompt,
+      executionOptions,
+    );
+
     const result = await session.appendAndRun(queryTask);
 
     if (!result) {
@@ -810,8 +1069,10 @@ export class TaskExecutor {
     const description = `waitFor: ${textPrompt}`;
     const session = this.createExecutionSession(
       taskTitleStr('WaitFor', description),
+      { referenceImages: multimodalPrompt?.images },
     );
     const runner = session.getRunner();
+    const executionModelRuntime = { ...modelRuntime, executionId: runner.id };
     const {
       timeoutMs,
       checkIntervalMs,
@@ -844,7 +1105,7 @@ export class TaskExecutor {
       const queryTask = await this.createTypeQueryTask(
         'WaitFor',
         textPrompt,
-        modelRuntime,
+        executionModelRuntime,
         serviceExtractOpt,
         multimodalPrompt,
       );
@@ -886,37 +1147,49 @@ export class TaskExecutor {
     return session.appendErrorPlan(`waitFor timeout: ${errorThought}`);
   }
 }
-
-export async function withFileChooser<T>(
-  interfaceInstance: AbstractInterface,
-  fileChooserAccept: string[] | undefined,
-  action: () => Promise<T>,
-): Promise<T> {
-  if (!fileChooserAccept?.length) {
-    return action();
-  }
-
-  if (!interfaceInstance.registerFileChooserListener) {
-    throw new Error(
-      `File upload is not supported on ${interfaceInstance.interfaceType}`,
-    );
-  }
-
-  const handler = async (chooser: FileChooserHandler) => {
-    await chooser.accept(fileChooserAccept);
-  };
-
-  const { dispose, getError } =
-    await interfaceInstance.registerFileChooserListener(handler);
-  try {
-    const result = await action();
-    // Check for errors that occurred during file chooser handling
-    const error = await getError();
-    if (error) {
-      throw error;
+/**
+ * Surface a captured screenshot sequence in the report timeline, then release
+ * it from the UIContext.
+ *
+ * When a UIObservation insight runs, the observed frames live on
+ * `uiContext.screenshotSequence` only as a transient model input. This attaches
+ * them to the task recorder so the report renders the full sequence the model
+ * saw (the report timeline builds one screenshot per recorder item), then drops
+ * the field from the UIContext so its base64 is not retained twice for the
+ * lifetime of the dump.
+ *
+ * The last frame is the representative `uiContext.screenshot`, already shown in
+ * the report, so only the earlier frames are recorded to avoid duplication.
+ * Observed frames are PREPENDED to `task.recorder` (rather than appended) so
+ * array order matches chronological order — they were captured before the
+ * assertion's before/after screenshots.
+ */
+export function recordAndReleaseScreenshotSequence(
+  task: ExecutionTask,
+  uiContext: UIContext | undefined,
+): void {
+  const frames = uiContext?.screenshotSequence;
+  if (frames && frames.length > 1) {
+    const recorderItems: ExecutionRecorderItem[] = [];
+    for (let i = 0; i < frames.length - 1; i++) {
+      const frame = frames[i];
+      recorderItems.push({
+        type: 'screenshot',
+        ts: frame.capturedAt,
+        screenshot: frame,
+        description: `Observed frame ${i + 1}/${frames.length}`,
+        timing: 'observed-frame',
+      });
     }
-    return result;
-  } finally {
-    dispose();
+    // Prepend observed frames so they appear before the task's own
+    // before/after screenshots in array order. Observed frames have earlier
+    // timestamps than the assertion task itself, so this keeps array order
+    // aligned with chronological order for consumers that iterate in-place.
+    task.recorder = task.recorder
+      ? [...recorderItems, ...task.recorder]
+      : recorderItems;
+  }
+  if (uiContext?.screenshotSequence) {
+    uiContext.screenshotSequence = undefined;
   }
 }

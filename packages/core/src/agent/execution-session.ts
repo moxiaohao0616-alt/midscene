@@ -1,4 +1,9 @@
-import { type TaskExecutionError, TaskRunner } from '@/task-runner';
+import {
+  type ExecutionReferenceImage,
+  type TaskExecutionError,
+  TaskRunner,
+  type TaskRunnerEventListener,
+} from '@/task-runner';
 import type {
   ExecutionTaskApply,
   ExecutionTaskProgressOptions,
@@ -7,10 +12,12 @@ import type {
 
 type ExecutionSessionOptions = ExecutionTaskProgressOptions & {
   tasks?: ExecutionTaskApply[];
-  onTaskUpdate?: (
+  referenceImages?: readonly ExecutionReferenceImage[];
+  onSnapshotChange?: (
     runner: TaskRunner,
     error?: TaskExecutionError,
   ) => Promise<void> | void;
+  onTaskEvent?: TaskRunnerEventListener;
 };
 
 /**

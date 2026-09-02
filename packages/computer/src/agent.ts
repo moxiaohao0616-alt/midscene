@@ -5,15 +5,18 @@ import { RDPDevice, type RDPDeviceOpt } from './rdp/device';
 
 export type ComputerInterface = ComputerDevice | RDPDevice;
 
-type ComputerAgentSharedDeviceOpt = Pick<ComputerDeviceOpt, 'customActions'>;
+type ComputerAgentSharedDeviceOpt = Pick<
+  ComputerDeviceOpt,
+  'customActions' | 'inputStrategy' | 'keyboardTypeDelay'
+>;
 
 export type BaseComputerAgentOpt = AgentOpt & ComputerAgentSharedDeviceOpt;
 
 export type LocalComputerAgentOpt = BaseComputerAgentOpt &
-  Omit<ComputerDeviceOpt, 'customActions'>;
+  Omit<ComputerDeviceOpt, keyof ComputerAgentSharedDeviceOpt>;
 
 export type RDPComputerAgentOpt = BaseComputerAgentOpt &
-  Omit<RDPDeviceOpt, 'customActions'>;
+  Omit<RDPDeviceOpt, keyof ComputerAgentSharedDeviceOpt>;
 export type ComputerAgentOpt = LocalComputerAgentOpt;
 
 export class ComputerAgent<
@@ -26,9 +29,12 @@ function createLocalComputerDevice(
   return new ComputerDevice({
     displayId: opts?.displayId,
     customActions: opts?.customActions,
+    keyboardTypeDelay: opts?.keyboardTypeDelay,
+    inputStrategy: opts?.inputStrategy,
     keyboardDriver: opts?.keyboardDriver,
     headless: opts?.headless,
     xvfbResolution: opts?.xvfbResolution,
+    keepXvfbAliveUntilProcessExit: opts?.keepXvfbAliveUntilProcessExit,
   });
 }
 
@@ -39,6 +45,7 @@ function createRDPComputerDevice(opts: RDPComputerAgentOpt): RDPDevice {
     username: opts.username,
     password: opts.password,
     domain: opts.domain,
+    localAddress: opts.localAddress,
     adminSession: opts.adminSession,
     ignoreCertificate: opts.ignoreCertificate,
     securityProtocol: opts.securityProtocol,
@@ -46,6 +53,8 @@ function createRDPComputerDevice(opts: RDPComputerAgentOpt): RDPDevice {
     desktopHeight: opts.desktopHeight,
     backend: opts.backend,
     customActions: opts.customActions,
+    keyboardTypeDelay: opts.keyboardTypeDelay,
+    inputStrategy: opts.inputStrategy,
   });
 }
 

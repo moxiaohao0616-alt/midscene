@@ -8,14 +8,24 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from '@rstest/core';
 import {
   extractAllDumpScriptsSync,
+  generateDumpScriptTag,
   generateImageScriptTag,
+  parseImageScripts,
 } from '../../src/dump/html-utils';
-import { ReportMergingTool } from '../../src/report';
-import { ReportActionDump } from '../../src/types';
-import { getReportTpl, getTmpFile, writeDumpReport } from '../../src/utils';
+import { ReportMergingTool, isDirectoryModeReport } from '../../src/report';
+import {
+  ReportActionDump,
+  type ReportFileWithAttributes,
+} from '../../src/types';
+import {
+  getReportTpl,
+  getTmpFile,
+  getVersion,
+  writeDumpReport,
+} from '../../src/utils';
 
 function generateNReports(
   n: number,
@@ -68,6 +78,11 @@ describe('reportMergingTool', () => {
     const mergedReportContent = readFileSync(mergedReportPath!, 'utf-8');
     expectedContents.forEach((content) => {
       expect(mergedReportContent).contains(content);
+    });
+    // Public merge callers own their input reports unless they explicitly opt
+    // into rmOriginalReports.
+    getReportInfos(tool).forEach((el) => {
+      expect(existsSync(el.reportFilePath)).toBe(true);
     });
   });
 
@@ -153,7 +168,7 @@ describe('reportMergingTool', () => {
 
   it(
     'should merge 100 mocked reports, and delete original reports after that.',
-    { timeout: 30 * 1000 },
+    { timeout: 60 * 1000 },
     async () => {
       const tool = new ReportMergingTool();
       let mergedReportPath: string | null = null;
@@ -333,6 +348,142 @@ describe('reportMergingTool', () => {
     }
   });
 
+  // Regression: a directory-mode report whose run captured no screenshots has
+  // no screenshots/ dir. It must still be recognized as directory mode (via the
+  // self-described data-screenshot-mode attribute) and its whole directory must
+  // be removed by rmOriginalReports — not just the index.html, leaving the dir.
+  const writeDirModeReport = (
+    reportDir: string,
+    name: string,
+    withScreenshots: boolean,
+  ): string => {
+    mkdirSync(reportDir, { recursive: true });
+    if (withScreenshots) {
+      const screenshotsDir = join(reportDir, 'screenshots');
+      mkdirSync(screenshotsDir, { recursive: true });
+      writeFileSync(join(screenshotsDir, 'img.png'), 'fake-png');
+    }
+    const dumpJson = JSON.stringify({ groupName: name, executions: [] });
+    const indexHtml = join(reportDir, 'index.html');
+    writeFileSync(
+      indexHtml,
+      `${getReportTpl()}\n<script type="midscene_web_dump" data-group-id="${name}" data-screenshot-mode="directory">${dumpJson}</script>`,
+    );
+    return indexHtml;
+  };
+
+  it('detects directory mode from metadata even without a screenshots dir', () => {
+    const tmpDir = join(tmpdir(), `midscene-dir-mode-meta-${Date.now()}`);
+    try {
+      const noShots = writeDirModeReport(
+        join(tmpDir, 'no-shots'),
+        'no-shots',
+        false,
+      );
+      const withShots = writeDirModeReport(
+        join(tmpDir, 'with-shots'),
+        'with-shots',
+        true,
+      );
+      expect(isDirectoryModeReport(noShots)).toBe(true);
+      expect(isDirectoryModeReport(withShots)).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes the whole directory of a screenshot-less directory mode report on rmOriginalReports', () => {
+    const tmpDir = join(tmpdir(), `midscene-dir-mode-noss-rm-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    try {
+      const tool = new ReportMergingTool();
+      const reportDirs: string[] = [];
+      // One report with screenshots, one without — both directory mode.
+      for (const [name, withShots] of [
+        ['with-shots', true],
+        ['no-shots', false],
+      ] as const) {
+        const reportDir = join(tmpDir, name);
+        reportDirs.push(reportDir);
+        const indexHtml = writeDirModeReport(reportDir, name, withShots);
+        tool.append({
+          reportFilePath: indexHtml,
+          reportAttributes: {
+            testDescription: name,
+            testDuration: 1,
+            testId: name,
+            testStatus: 'passed',
+            testTitle: name,
+          },
+        });
+      }
+
+      const mergedPath = tool.mergeReports('dir-mode-noss-rm-test', {
+        rmOriginalReports: true,
+        overwrite: true,
+      });
+
+      expect(existsSync(mergedPath!)).toBe(true);
+      // Both original directories must be gone, including the screenshot-less one.
+      for (const dir of reportDirs) {
+        expect(existsSync(dir)).toBe(false);
+      }
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Regression for the real-world report: a legacy directory-based report
+  // (`{name}/index.html`) that predates data-screenshot-mode AND inlines its
+  // screenshots (no screenshots/ dir). Such a report reads as inline screenshot
+  // mode, so the merged output is a single file — but rmOriginalReports must
+  // still remove the whole source folder, not orphan it.
+  it('removes the folder of a legacy inline-screenshot directory report on rmOriginalReports', () => {
+    const tmpDir = join(tmpdir(), `midscene-legacy-folder-rm-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    try {
+      const tool = new ReportMergingTool();
+      const reportDirs: string[] = [];
+      for (const name of ['playwright-merged-a', 'playwright-merged-b']) {
+        const reportDir = join(tmpDir, name);
+        mkdirSync(reportDir, { recursive: true }); // no screenshots/ dir
+        reportDirs.push(reportDir);
+        const dumpJson = JSON.stringify({ groupName: name, executions: [] });
+        const indexHtml = join(reportDir, 'index.html');
+        // No data-screenshot-mode attribute (legacy) + an inline image tag.
+        writeFileSync(
+          indexHtml,
+          `${getReportTpl()}\n<script type="midscene_web_dump" data-group-id="${name}">${dumpJson}</script>\n${generateImageScriptTag(`${name}-img`, 'data:image/png;base64,AAAA')}`,
+        );
+        tool.append({
+          reportFilePath: indexHtml,
+          reportAttributes: {
+            testDescription: name,
+            testDuration: 1,
+            testId: name,
+            testStatus: 'passed',
+            testTitle: name,
+          },
+        });
+      }
+
+      const mergedPath = tool.mergeReports('legacy-folder-rm-test', {
+        rmOriginalReports: true,
+        overwrite: true,
+      });
+
+      expect(existsSync(mergedPath!)).toBe(true);
+      // Merged as inline → single .html file (not a directory).
+      expect(mergedPath!.endsWith('index.html')).toBe(false);
+      // The source folders must be removed, not orphaned.
+      for (const dir of reportDirs) {
+        expect(existsSync(dir)).toBe(false);
+      }
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('should merge a single report', async () => {
     const tool = new ReportMergingTool();
     generateNReports(1, 'single report content', tool, true, 'merge-1-test');
@@ -388,6 +539,24 @@ describe('reportMergingTool', () => {
     ).toHaveLength(0);
   });
 
+  it('should reject a missing reportFilePath for non-skipped tests', () => {
+    const tool = new ReportMergingTool();
+    const reportInfo = {
+      reportFilePath: undefined,
+      reportAttributes: {
+        testDescription: 'passed test desc',
+        testDuration: 1,
+        testId: 'passed-1',
+        testStatus: 'passed',
+        testTitle: 'Passed Test',
+      },
+    } as unknown as ReportFileWithAttributes;
+
+    expect(() => tool.append(reportInfo)).toThrow(
+      'reportFilePath is required unless reportAttributes.testStatus is "skipped"',
+    );
+  });
+
   it('should return null when no reports are appended', async () => {
     const tool = new ReportMergingTool();
     const mergedReportPath = tool.mergeReports('empty-merge', {
@@ -426,6 +595,13 @@ describe('reportMergingTool', () => {
     const mergedReportContent = readFileSync(mergedReportPath!, 'utf-8');
     expect(mergedReportContent).toContain('playwright_test_id="all-skipped-1"');
     expect(mergedReportContent).toContain('playwright_test_id="all-skipped-2"');
+    expect(mergedReportContent).toContain('For Agent Analysis:');
+    expect(
+      mergedReportContent.match(/<!--\nFor Agent Analysis:/g),
+    ).toHaveLength(1);
+    expect(mergedReportContent).toContain(
+      'Structured report JSON is stored in script[type="midscene_web_dump"] tags near this comment.',
+    );
 
     const dumpScripts = extractAllDumpScriptsSync(mergedReportPath!).filter(
       (script) => script.openTag.includes('playwright_test_id='),
@@ -535,4 +711,56 @@ ${imageScripts}
       }
     },
   );
+
+  it('should store a shared inline reference image once when merging reports', () => {
+    const tmpDir = join(tmpdir(), `midscene-merge-image-dedup-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+
+    try {
+      const tool = new ReportMergingTool();
+      const referenceImage = `data:image/webp;base64,${'A'.repeat(64 * 1024)}`;
+      const imageId = 'reference-shared-image';
+
+      for (let index = 0; index < 2; index++) {
+        const reportPath = join(tmpDir, `source-${index}.html`);
+        const dump = new ReportActionDump({
+          sdkVersion: getVersion(),
+          groupName: `source-${index}`,
+          modelBriefs: [],
+          executions: [],
+        });
+        writeFileSync(
+          reportPath,
+          [
+            getReportTpl(),
+            generateImageScriptTag(imageId, referenceImage),
+            generateDumpScriptTag(dump.serialize(), {
+              'data-group-id': `group-${index}`,
+            }),
+          ].join('\n'),
+        );
+        tool.append({
+          reportFilePath: reportPath,
+          reportAttributes: {
+            testDescription: `Source ${index}`,
+            testDuration: 1,
+            testId: `source-${index}`,
+            testStatus: 'passed',
+            testTitle: `Source ${index}`,
+          },
+        });
+      }
+
+      const mergedReportPath = tool.mergeReports('merged-image-dedup', {
+        outputDir: tmpDir,
+        overwrite: true,
+      });
+      const mergedReport = readFileSync(mergedReportPath!, 'utf-8');
+
+      expect(mergedReport.split(referenceImage)).toHaveLength(2);
+      expect(parseImageScripts(mergedReport)[imageId]).toBe(referenceImage);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

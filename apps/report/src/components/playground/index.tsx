@@ -7,6 +7,13 @@ import type {
 } from '@midscene/core';
 import { GroupedActionDump } from '@midscene/core';
 import { paramStr, typeStr } from '@midscene/core/agent';
+import {
+  createInlineImageResolver,
+  parseDumpScript,
+  parseImageScripts,
+  restoreImageReferences,
+  restoreReportImageReferences,
+} from '@midscene/core/dump';
 import { type PlaygroundSDK, noReplayAPIs } from '@midscene/playground';
 import type { ServerResponse } from '@midscene/playground';
 import {
@@ -23,7 +30,7 @@ import {
   useServerValid,
 } from '@midscene/visualizer';
 import type { StaticPageAgent } from '@midscene/web/static';
-import { Form, message } from 'antd';
+import { App as AntdApp, Form } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import {
@@ -34,12 +41,35 @@ import {
 // Constants
 const DEFAULT_AGENT_ERROR = 'PlaygroundSDK not initialized';
 
-const blankResult = {
+const blankResult: PlaygroundResult = {
   result: null,
   dump: null,
   reportHTML: null,
+  report: null,
   error: null,
 };
+
+async function loadReferencedReplay(result: PlaygroundResult) {
+  if (result.dump || !result.report?.replayUrl) return;
+  const response = await fetch(result.report.replayUrl);
+  if (!response.ok) {
+    throw new Error(`Report replay request failed (${response.status})`);
+  }
+  const dump = (await response.json()) as IReportActionDump;
+  result.dump = restoreReportImageReferences(
+    dump,
+    result.report.url,
+  ) as IReportActionDump;
+}
+
+function dumpFromReportHTML(reportHTML: string): IReportActionDump {
+  const images = parseImageScripts(reportHTML);
+  const resolveInlineImage = createInlineImageResolver(images);
+  return restoreImageReferences(
+    JSON.parse(parseDumpScript(reportHTML)) as IReportActionDump,
+    resolveInlineImage,
+  ) as IReportActionDump;
+}
 
 // Utility function to determine if the run button should be enabled
 function getRunButtonEnabled(
@@ -70,6 +100,7 @@ export function StandardPlayground({
   dryMode = false,
   canDownloadReport,
 }: PlaygroundProps) {
+  const { message } = AntdApp.useApp();
   const { serviceMode } = useEnvConfig();
   // State management
   const [uiContextPreview, setUiContextPreview] = useState<
@@ -329,6 +360,7 @@ export function StandardPlayground({
           result.result = response.result;
           result.dump = response.dump;
           result.reportHTML = response.reportHTML;
+          result.report = response.report;
           if (response.error) {
             result.error = response.error;
           }
@@ -358,6 +390,7 @@ export function StandardPlayground({
           result.result = serverResponse.result;
           result.dump = serverResponse.dump;
           result.reportHTML = serverResponse.reportHTML;
+          result.report = serverResponse.report;
         } else {
           result.result = response;
         }
@@ -378,6 +411,12 @@ export function StandardPlayground({
     if (interruptedFlagRef.current[thisRunningId]) {
       console.log('interrupted, result is', result);
       return;
+    }
+
+    try {
+      await loadReferencedReplay(result);
+    } catch (error) {
+      console.error('Failed to load referenced playground replay:', error);
     }
 
     try {
@@ -415,6 +454,7 @@ export function StandardPlayground({
     if (noReplayAPIs.includes(actionType)) {
       result.dump = null;
       result.reportHTML = null;
+      result.report = null;
     }
 
     setResult(result);
@@ -423,9 +463,17 @@ export function StandardPlayground({
 
     // Only generate replay info for interaction APIs, not for data extraction or validation APIs
 
-    if (result?.dump && !noReplayAPIs.includes(actionType)) {
+    if (
+      (result?.dump || result?.reportHTML) &&
+      !noReplayAPIs.includes(actionType)
+    ) {
       const info = allScriptsFromDump(
-        result.dump as ReportActionDump | IReportActionDump | ExecutionDump,
+        result.dump
+          ? (result.dump as
+              | ReportActionDump
+              | IReportActionDump
+              | ExecutionDump)
+          : dumpFromReportHTML(result.reportHTML!),
       );
       setReplayScriptsInfo(info);
       setReplayCounter((c) => c + 1);

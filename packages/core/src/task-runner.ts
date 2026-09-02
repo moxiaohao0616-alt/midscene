@@ -13,18 +13,99 @@ import {
   type PlanningActionParamError,
   type UIContext,
 } from '@/types';
+import {
+  type SerializedError,
+  serializeError,
+  truncateSerializedErrorString,
+} from '@midscene/shared/agent-tools/error-formatter';
 import { getDebug } from '@midscene/shared/logger';
 import { assert, uuid } from '@midscene/shared/utils';
 
 const debug = getDebug('task-runner');
 const UI_CONTEXT_CACHE_TTL_MS = 300;
 
+/**
+ * A native, per-task lifecycle notification. The runner is the single source
+ * of truth for when a task actually transitions, so it reports each transition
+ * exactly once with the task that changed. Consumers no longer have to re-scan
+ * the task list and diff it against remembered keys to reconstruct this stream.
+ */
+export type TaskRunnerEventKind =
+  | 'append'
+  | 'start'
+  | 'finish'
+  | 'error'
+  | 'cancel';
+
+export interface TaskRunnerEvent {
+  kind: TaskRunnerEventKind;
+  task: ExecutionTask;
+  runner: TaskRunner;
+}
+
+export interface SerializedErrorTask {
+  taskId: string;
+  type: ExecutionTask['type'];
+  subType?: string;
+  status: ExecutionTask['status'];
+  thought?: string;
+  errorMessage?: string;
+}
+
+export interface SerializedTaskExecutionError extends SerializedError {
+  code: 'TASK_EXECUTION_FAILED';
+  cause: SerializedError;
+  task?: SerializedErrorTask;
+}
+
+function serializeErrorTask(
+  task: ExecutionTask | null,
+): SerializedErrorTask | undefined {
+  if (!task) {
+    return undefined;
+  }
+
+  return {
+    taskId: truncateSerializedErrorString(task.taskId),
+    type: task.type,
+    ...(task.subType === undefined
+      ? {}
+      : { subType: truncateSerializedErrorString(task.subType) }),
+    status: task.status,
+    ...(task.thought === undefined
+      ? {}
+      : { thought: truncateSerializedErrorString(task.thought) }),
+    ...(task.errorMessage === undefined
+      ? {}
+      : {
+          errorMessage: truncateSerializedErrorString(task.errorMessage),
+        }),
+  };
+}
+
+export type TaskRunnerEventListener = (
+  event: TaskRunnerEvent,
+) => Promise<void> | void;
+
+/** Minimal prompt-image shape retained as report asset metadata. */
+export interface ExecutionReferenceImage {
+  readonly url: string;
+}
+
 type TaskRunnerInitOptions = ExecutionTaskProgressOptions & {
   tasks?: ExecutionTaskApply[];
-  onTaskUpdate?: (
+  referenceImages?: readonly ExecutionReferenceImage[];
+  /**
+   * Coarse "the execution snapshot changed" signal. Fires on any state change
+   * (append, status flips, completion) with the whole runner, so consumers can
+   * re-dump/re-render the current snapshot. Deliberately batch-granular, unlike
+   * the per-task {@link onTaskEvent} stream.
+   */
+  onSnapshotChange?: (
     runner: TaskRunner,
     error?: TaskExecutionError,
   ) => Promise<void> | void;
+  onTaskEvent?: TaskRunnerEventListener;
 };
 
 type TaskRunnerOperationOptions = {
@@ -44,11 +125,15 @@ export class TaskRunner {
 
   private readonly uiContextBuilder: () => Promise<UIContext>;
 
-  private readonly onTaskUpdate?:
+  private readonly onSnapshotChange?:
     | ((runner: TaskRunner, error?: TaskExecutionError) => Promise<void> | void)
     | undefined;
 
+  private readonly onTaskEvent?: TaskRunnerEventListener | undefined;
+
   private readonly executionLogTime: number;
+
+  private readonly referenceImageUrls = new Set<string>();
 
   constructor(
     name: string,
@@ -64,15 +149,33 @@ export class TaskRunner {
     );
     this.onTaskStart = options?.onTaskStart;
     this.uiContextBuilder = uiContextBuilder;
-    this.onTaskUpdate = options?.onTaskUpdate;
+    this.onSnapshotChange = options?.onSnapshotChange;
+    this.onTaskEvent = options?.onTaskEvent;
     this.executionLogTime = Date.now();
+    for (const image of options?.referenceImages ?? []) {
+      this.referenceImageUrls.add(image.url);
+    }
   }
 
-  private async emitOnTaskUpdate(error?: TaskExecutionError): Promise<void> {
-    if (!this.onTaskUpdate) {
+  private async emitSnapshotChange(error?: TaskExecutionError): Promise<void> {
+    if (!this.onSnapshotChange) {
       return;
     }
-    await this.onTaskUpdate(this, error);
+    await this.onSnapshotChange(this, error);
+  }
+
+  private async emitTaskEvent(
+    kind: TaskRunnerEventKind,
+    task: ExecutionTask,
+  ): Promise<void> {
+    if (!this.onTaskEvent) {
+      return;
+    }
+    try {
+      await this.onTaskEvent({ kind, task, runner: this });
+    } catch (error) {
+      console.error('Error in onTaskEvent listener', error);
+    }
   }
 
   private lastUiContext?: {
@@ -164,7 +267,7 @@ export class TaskRunner {
     assert(
       options?.allowWhenError,
       errorMessage ||
-        `task runner is in error state, cannot proceed\nerror=${this.latestErrorTask()?.error}\n${this.latestErrorTask()?.errorStack}`,
+        `task runner is in error state, cannot proceed\nerror=${this.latestErrorTask()?.errorMessage}\n${this.latestErrorTask()?.errorStack}`,
     );
     // reset runner state so new tasks can run
     this.status = this.tasks.length > 0 ? 'pending' : 'init';
@@ -176,17 +279,22 @@ export class TaskRunner {
   ): Promise<void> {
     this.normalizeStatusFromError(
       options,
-      `task runner is in error state, cannot append task\nerror=${this.latestErrorTask()?.error}\n${this.latestErrorTask()?.errorStack}`,
+      `task runner is in error state, cannot append task\nerror=${this.latestErrorTask()?.errorMessage}\n${this.latestErrorTask()?.errorStack}`,
     );
+    const appended: ExecutionTask[] = [];
     if (Array.isArray(task)) {
-      this.tasks.push(...task.map((item) => this.markTaskAsPending(item)));
+      appended.push(...task.map((item) => this.markTaskAsPending(item)));
     } else {
-      this.tasks.push(this.markTaskAsPending(task));
+      appended.push(this.markTaskAsPending(task));
     }
+    this.tasks.push(...appended);
     if (this.status !== 'running') {
       this.status = 'pending';
     }
-    await this.emitOnTaskUpdate();
+    await this.emitSnapshotChange();
+    for (const appendedTask of appended) {
+      await this.emitTaskEvent('append', appendedTask);
+    }
   }
 
   async appendAndFlush(
@@ -219,7 +327,7 @@ export class TaskRunner {
     }
 
     this.status = 'running';
-    await this.emitOnTaskUpdate();
+    await this.emitSnapshotChange();
     let taskIndex = nextPendingIndex;
     let successfullyCompleted = true;
 
@@ -236,7 +344,8 @@ export class TaskRunner {
       };
       try {
         task.status = 'running';
-        await this.emitOnTaskUpdate();
+        await this.emitSnapshotChange();
+        await this.emitTaskEvent('start', task);
         try {
           if (this.onTaskStart) {
             await this.onTaskStart(task);
@@ -249,7 +358,7 @@ export class TaskRunner {
           `unsupported task type: ${task.type}`,
         );
 
-        const { executor, param } = task;
+        const { executor } = task;
         assert(executor, `executor is required for task type: ${task.type}`);
 
         let returnValue;
@@ -277,21 +386,28 @@ export class TaskRunner {
               task.subType === 'String',
             `unsupported service subType: ${task.subType}`,
           );
-          returnValue = await task.executor(param, executorContext);
+          returnValue = await task.executor(executorContext);
         } else if (task.type === 'Planning') {
-          returnValue = await task.executor(param, executorContext);
+          returnValue = await task.executor(executorContext);
           if (task.subType === 'Locate') {
             previousFindOutput = (
               returnValue as ExecutionTaskReturn<ExecutionTaskPlanningLocateOutput>
             )?.output;
           }
         } else if (task.type === 'Action Space') {
-          returnValue = await task.executor(param, executorContext);
+          try {
+            returnValue = await task.executor(executorContext);
+          } finally {
+            // The short TTL still lets planning and the action itself share one
+            // context. Once an action settles, time alone can no longer prove
+            // that the cached context represents the current UI.
+            this.lastUiContext = undefined;
+          }
         } else {
           console.warn(
             `unsupported task type: ${task.type}, will try to execute it directly`,
           );
-          returnValue = await task.executor(param, executorContext);
+          returnValue = await task.executor(executorContext);
         }
 
         const isLastTask = taskIndex === this.tasks.length - 1;
@@ -307,47 +423,54 @@ export class TaskRunner {
         task.status = 'finished';
         task.timing.end = Date.now();
         task.timing.cost = task.timing.end - task.timing.start;
-        await this.emitOnTaskUpdate();
+        await this.emitSnapshotChange();
+        await this.emitTaskEvent('finish', task);
         taskIndex++;
-      } catch (e: any) {
+      } catch (error) {
         successfullyCompleted = false;
-        task.error = e;
-        task.errorMessage =
-          e?.message || (typeof e === 'string' ? e : 'error-without-message');
-        task.errorStack = e.stack;
+        const serializedError = serializeError(error);
+        task.error = serializedError;
+        task.errorMessage = serializedError.message;
+        task.errorStack = serializedError.stack;
 
         task.status = 'failed';
         task.timing.end = Date.now();
         task.timing.cost = task.timing.end - task.timing.start;
-        await this.emitOnTaskUpdate();
+        await this.emitSnapshotChange();
+        await this.emitTaskEvent('error', task);
         break;
       }
     }
 
     // set all remaining tasks as cancelled
+    const cancelledTasks: ExecutionTask[] = [];
     for (let i = taskIndex + 1; i < this.tasks.length; i++) {
       this.tasks[i].status = 'cancelled';
+      cancelledTasks.push(this.tasks[i]);
     }
-    if (taskIndex + 1 < this.tasks.length) {
-      await this.emitOnTaskUpdate();
+    if (cancelledTasks.length > 0) {
+      await this.emitSnapshotChange();
+      for (const cancelledTask of cancelledTasks) {
+        await this.emitTaskEvent('cancel', cancelledTask);
+      }
     }
 
     let finalizeError: TaskExecutionError | undefined;
     if (!successfullyCompleted) {
       this.status = 'error';
       const errorTask = this.latestErrorTask();
-      const messageBase =
-        errorTask?.errorMessage ||
-        (errorTask?.error ? String(errorTask.error) : 'Task execution failed');
-      const stack = errorTask?.errorStack;
-      const message = stack ? `${messageBase}\n${stack}` : messageBase;
-      finalizeError = new TaskExecutionError(message, this, errorTask, {
-        cause: errorTask?.error,
-      });
-      await this.emitOnTaskUpdate(finalizeError);
+      const error = errorTask?.error ?? {
+        name: 'Error',
+        message: 'Task execution failed',
+      };
+      finalizeError = new TaskExecutionError(
+        error,
+        serializeErrorTask(errorTask),
+      );
+      await this.emitSnapshotChange(finalizeError);
     } else {
       this.status = 'completed';
-      await this.emitOnTaskUpdate();
+      await this.emitSnapshotChange();
     }
 
     if (finalizeError) {
@@ -384,12 +507,15 @@ export class TaskRunner {
   }
 
   dump(): ExecutionDump {
-    return new ExecutionDump({
-      id: this.id,
-      logTime: this.executionLogTime,
-      name: this.name,
-      tasks: this.tasks,
-    });
+    return new ExecutionDump(
+      {
+        id: this.id,
+        logTime: this.executionLogTime,
+        name: this.name,
+        tasks: this.tasks,
+      },
+      { referenceImageUrls: [...this.referenceImageUrls] },
+    );
   }
 
   async appendErrorPlan(errorMsg: string): Promise<{
@@ -417,18 +543,35 @@ export class TaskRunner {
 }
 
 export class TaskExecutionError extends Error {
-  runner: TaskRunner;
+  readonly code = 'TASK_EXECUTION_FAILED' as const;
 
-  errorTask: ExecutionTask | null;
+  override readonly cause: SerializedError;
 
-  constructor(
-    message: string,
-    runner: TaskRunner,
-    errorTask: ExecutionTask | null,
-    options?: { cause?: unknown },
-  ) {
-    super(message, options);
-    this.runner = runner;
-    this.errorTask = errorTask;
+  readonly task?: SerializedErrorTask;
+
+  constructor(error: SerializedError, task?: SerializedErrorTask) {
+    super(error.message, { cause: error });
+    this.name = 'TaskExecutionError';
+    this.cause = error;
+    this.task = task;
+    if (this.stack) {
+      this.stack = truncateSerializedErrorString(this.stack);
+    }
+  }
+
+  /**
+   * Return the same bounded fields already stored on the live error. The
+   * wrapper stack identifies where TaskExecutionError was created; cause.stack
+   * preserves the executor's original stack.
+   */
+  toJSON(): SerializedTaskExecutionError {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      ...(this.stack === undefined ? {} : { stack: this.stack }),
+      cause: this.cause,
+      ...(this.task === undefined ? {} : { task: this.task }),
+    };
   }
 }

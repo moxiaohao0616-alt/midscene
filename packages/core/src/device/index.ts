@@ -3,13 +3,21 @@ import { getMidsceneLocationSchema } from '@/common';
 import type {
   ActionScrollParam,
   DeviceAction,
+  ExecutorContext,
   LocateResultElement,
 } from '@/types';
 import type { ElementNode } from '@midscene/shared/extractor';
 import { getDebug } from '@midscene/shared/logger';
 import { _keyDefinitions } from '@midscene/shared/us-keyboard-layout';
 import { z } from 'zod';
-import type { ElementCacheFeature, Rect, Size, UIContext } from '../types';
+import type {
+  ElementCacheFeature,
+  Rect,
+  Size,
+  UIContext,
+  UITreeSnapshot,
+} from '../types';
+import { type InputStrategy, inputStrategies } from './input-strategy';
 
 export interface FileChooserHandler {
   accept(files: string[]): Promise<void>;
@@ -34,6 +42,36 @@ export interface MjpegStreamOptions {
   signal?: AbortSignal;
   onFrame(frame: MjpegStreamFrame): void;
   onError?(error: unknown): void;
+}
+
+/**
+ * A cheap, not-yet-decoded handle to one screen frame from a
+ * {@link DeviceFrameSource}. `ref` is platform-specific (a raw H.264 keyframe
+ * buffer on Android, an already-encoded JPEG data URL on iOS/web) and must not
+ * be interpreted by callers — pass it back to `decode()` to materialize.
+ */
+export interface DeviceFrameRef {
+  ref: unknown;
+  capturedAt: number;
+}
+
+/**
+ * A continuous screen-frame source opened via
+ * {@link AbstractInterface.openFrameSource}. Designed for deferred decoding:
+ * grabbing `latest()` is near-zero cost, so observers can sample at a steady
+ * cadence and pay any decode cost only once, for the frames they keep.
+ */
+export interface DeviceFrameSource {
+  /** Latest frame handle, near-zero cost. Null until the first frame arrives. */
+  latest(): DeviceFrameRef | null;
+  /**
+   * Materialize frame handles into `data:image/...;base64,` URLs, preserving
+   * order. Possibly expensive (e.g. one ffmpeg run per unique frame on
+   * Android) — call once with the sampled handles, never per tick.
+   */
+  decode(refs: DeviceFrameRef[]): Promise<string[]>;
+  /** Release the source (stop streams/subscriptions it started). */
+  stop(): Promise<void> | void;
 }
 
 /** A point in device-pixel coordinates on the screen. */
@@ -71,6 +109,8 @@ export interface KeyboardInputPrimitives {
     opts?: {
       autoDismissKeyboard?: boolean;
       keyboardDismissStrategy?: 'esc-first' | 'back-first';
+      keyboardTypeDelay?: number;
+      inputStrategy?: InputStrategy;
       target?: unknown;
       replace?: boolean;
       focusOnly?: boolean;
@@ -149,6 +189,8 @@ export abstract class AbstractInterface {
     feature: ElementCacheFeature,
   ): Promise<Rect>;
 
+  abstract getUITree?(): Promise<UITreeSnapshot>;
+
   abstract destroy?(): Promise<void>;
 
   abstract describe?(): string;
@@ -180,6 +222,20 @@ export abstract class AbstractInterface {
   mjpegStreamUrl?: string;
 
   /**
+   * Optional continuous frame source for UI observation (`startObserving`).
+   * Devices that maintain a continuous frame stream — scrcpy on Android, WDA
+   * MJPEG on iOS, CDP screencast on web — implement this so an observer can
+   * sample the screen far faster than repeated `screenshotBase64()` calls,
+   * catching short-lived UI (toasts, carousels, transitions).
+   *
+   * The contract enables DEFERRED decoding: `latest()` returns a cheap opaque
+   * handle (e.g. a raw H.264 keyframe on Android) with no per-frame decode
+   * cost, and `decode()` materializes only the handles that were actually
+   * sampled — once, at the end of the observation window.
+   */
+  openFrameSource?(): Promise<DeviceFrameSource | undefined>;
+
+  /**
    * Optional in-process MJPEG frame producer. Implementations can push raw
    * base64 frames here when there is no standalone native MJPEG URL, e.g.
    * Chromium CDP Page.startScreencast for web previews.
@@ -189,11 +245,20 @@ export abstract class AbstractInterface {
   ): MjpegStreamHandle | undefined | Promise<MjpegStreamHandle | undefined>;
 
   /**
-   * Optional hook used after keyboard-only actions to force a fresh frame on
-   * the active MJPEG stream. Implementations should be a no-op when no stream
-   * is active.
+   * Optional hook used after a UI action to push a fresh frame on the active
+   * MJPEG stream. Set `force` after navigation to replace a transient loading
+   * frame even when the screencast has already emitted one. Implementations
+   * should be a no-op when no stream is active.
    */
-  flushPendingVisualUpdate?(): Promise<void>;
+  flushPendingVisualUpdate?(force?: boolean): Promise<void>;
+
+  /**
+   * Optional non-blocking variant of `flushPendingVisualUpdate`. Keyboard-
+   * heavy preview interactions can schedule a coalesced refresh here without
+   * stalling the input hot path; `force` preserves a requested navigation
+   * refresh while work is already queued.
+   */
+  schedulePendingVisualUpdate?(force?: boolean): void;
 
   /**
    * Optional navigation state probe for browser-like interfaces, used to drive
@@ -223,7 +288,10 @@ export const defineAction = <
     description: string;
     interfaceAlias?: string;
     paramSchema?: TSchema;
-    call: (param: TRuntime) => Promise<TReturn> | TReturn;
+    call: (
+      param: TRuntime,
+      context?: ExecutorContext,
+    ) => Promise<TReturn> | TReturn;
   } & Partial<
     Omit<
       DeviceAction<TRuntime, TReturn>,
@@ -293,6 +361,38 @@ export const defineActionTap = (
     missingLocateMessage: 'Element not found, cannot tap',
     call: async (point) => {
       await tap(point);
+    },
+  });
+};
+
+export const registerFileChooserAcceptParamSchema = z.object({
+  files: z
+    .union([z.string(), z.array(z.string())])
+    .describe(
+      "File path(s) within the current aiAct call's fileChooserAllowedDir to use whenever a later action triggers a file chooser. fileChooserAllowedDir must be provided for this action. This setting replaces any previously registered file path(s).",
+    ),
+});
+export type RegisterFileChooserAcceptParam = {
+  files: string | string[];
+};
+
+export const defineActionRegisterFileChooserAccept = (
+  register: (files: string | string[]) => Promise<void>,
+): DeviceAction<RegisterFileChooserAcceptParam> => {
+  return defineAction<
+    typeof registerFileChooserAcceptParamSchema,
+    RegisterFileChooserAcceptParam
+  >({
+    name: 'RegisterFileChooserAccept',
+    description:
+      'Configure files for file chooser dialogs triggered by later actions in this aiAct',
+    interfaceAlias: 'registerFileChooserAccept',
+    paramSchema: registerFileChooserAcceptParamSchema,
+    sample: {
+      files: ['fixtures/document.pdf'],
+    },
+    call: async (param) => {
+      await register(param.files);
     },
   });
 };
@@ -413,12 +513,28 @@ export const actionInputParamSchema = z.object({
     .describe(
       'If true, the keyboard will be dismissed after the input is completed. Do not set it unless the user asks you to do so.',
     ),
+  keyboardTypeDelay: z
+    .number()
+    .finite()
+    .nonnegative()
+    .optional()
+    .describe(
+      'Delay in milliseconds between keystrokes when typing. Passed through from device/user configuration. Do not set it unless the user asks you to do so.',
+    ),
+  inputStrategy: z
+    .enum(inputStrategies)
+    .optional()
+    .describe(
+      'Text input strategy: "legacy" (default) preserves the current platform behavior; "sequential" enters one Unicode code point at a time; "bulk" sends the complete text through one platform input operation when supported and requires keyboardTypeDelay to be omitted or set to 0. Do not set it unless the user asks you to do so.',
+    ),
 });
 export type ActionInputParam = {
   value: string;
   locate?: LocateResultElement;
   mode?: 'replace' | 'clear' | 'typeOnly' | 'append';
   autoDismissKeyboard?: boolean;
+  keyboardTypeDelay?: number;
+  inputStrategy?: InputStrategy;
 };
 
 export const defineActionInput = (
@@ -452,6 +568,8 @@ export const defineActionInput = (
         target: param.locate,
         replace: param.mode !== 'typeOnly',
         autoDismissKeyboard: param.autoDismissKeyboard,
+        keyboardTypeDelay: param.keyboardTypeDelay,
+        inputStrategy: param.inputStrategy,
       });
     },
   });
@@ -460,7 +578,9 @@ export const defineActionInput = (
 // KeyboardPress
 export const actionKeyboardPressParamSchema = z.object({
   locate: getMidsceneLocationSchema()
-    .describe('The element to be clicked before pressing the key')
+    .describe(
+      'The optional element to click before pressing the key. Omit this when the key should operate on the currently focused element, especially when copying or cutting an existing text selection.',
+    )
     .optional(),
   keyName: z
     .string()
@@ -482,7 +602,7 @@ export const defineActionKeyboardPress = (
   >({
     name: 'KeyboardPress',
     description:
-      'Press a key or key combination, like "Enter", "Tab", "Escape", or "Control+A", "Shift+Enter". Do not use this to type text.',
+      'Press a key or key combination, like "Enter", "Tab", "Escape", or "Control+A", "Shift+Enter". Do not use this to type text. Omit locate to operate on the current focus without clicking again, especially for Copy or Cut after text has been selected.',
     interfaceAlias: 'aiKeyboardPress',
     paramSchema: actionKeyboardPressParamSchema,
     sample: {
@@ -1094,6 +1214,17 @@ export const defineActionSleep = (): DeviceAction<ActionSleepParam> => {
 };
 
 export type { DeviceAction } from '../types';
+export {
+  inputStrategies,
+  type InputStrategy,
+  type ResolvedTextInputOptions,
+  type SequentialTextInputHandlers,
+  type TextInputOptions,
+  resolveInputStrategy,
+  resolveTextInputOptions,
+  sendTextSequentially,
+  shouldInputSequentially,
+} from './input-strategy';
 export type {
   AndroidDeviceOpt,
   AndroidDeviceInputOpt,
