@@ -641,7 +641,7 @@ export const actionScrollParamSchema = z.object({
     .nullable()
     .optional()
     .describe(
-      'The distance in pixels to scroll. When searching or browsing unseen content (e.g. off-screen table columns, list items, fields), leave distance null (or omit it) to automatically advance by one full container page (90% of visible container size). Do NOT specify tiny distances (< 300px) when exploring/locating content.',
+      'The distance in pixels to scroll. When searching or browsing unseen content (e.g. off-screen table columns, list items, fields), leave distance null (or omit it) to automatically advance by one full container page (70% of visible container size with 30% overlap). Do NOT specify tiny distances (< 300px) when exploring/locating content.',
     ),
   locate: getMidsceneLocationSchema()
     .optional()
@@ -656,7 +656,7 @@ export const defineActionScroll = (
   return defineAction<typeof actionScrollParamSchema, ActionScrollParam>({
     name: 'Scroll',
     description:
-      'Scroll the page or a scrollable container (e.g. tables, lists) to browse unseen content. This is the preferred way to scroll on all platforms, including mobile and desktop web. When searching for off-screen table columns, fields, or list items, use Scroll with direction ("right"/"down"/"left"/"up") and leave distance null to automatically advance by one full container page (90% of visible container width/height). Do NOT specify micro distances (< 300px) when browsing/searching. Supports scrollToBottom/scrollToTop/scrollToRight/scrollToLeft for boundary navigation. Default: direction `down`, scrollType `singleAction`, distance `null`.',
+      'Scroll the page or a scrollable container (e.g. tables, lists) to browse unseen content. This is the preferred way to scroll on all platforms, including mobile and desktop web. When searching for off-screen table columns, fields, or list items, use Scroll with direction ("right"/"down"/"left"/"up") and leave distance null to automatically advance by one full container page (70% of visible container width/height with 30% overlap). Do NOT specify micro distances (< 300px) when browsing/searching. Supports scrollToBottom/scrollToTop/scrollToRight/scrollToLeft for boundary navigation. Default: direction `down`, scrollType `singleAction`, distance `null`.',
     interfaceAlias: 'aiScroll',
     paramSchema: actionScrollParamSchema,
     sample: {
